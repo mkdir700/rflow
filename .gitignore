@@ -1,0 +1,10 @@
+/target
+*.key
+*.der
+.idea/
+.vscode/
+
+# Local implementation records
+/task_plan.md
+/findings.md
+/progress.md

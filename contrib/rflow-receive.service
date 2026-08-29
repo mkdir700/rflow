@@ -1,0 +1,21 @@
+[Unit]
+Description=rflow low-latency input receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rflow receive --bind 0.0.0.0:24801 --cert /etc/rflow/rflow-cert.der --key /etc/rflow/rflow-key.der
+Restart=on-failure
+RestartSec=2
+User=rflow
+Group=input
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+DeviceAllow=/dev/uinput rw
+
+[Install]
+WantedBy=multi-user.target
+
