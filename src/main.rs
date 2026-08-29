@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Generate the receiver certificate and private key.
+    /// Generate this host's certificate and private key.
     Keygen {
         #[arg(long, default_value = "rflow-cert.der")]
         cert: PathBuf,
@@ -36,8 +36,8 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Receive input and inject it through /dev/uinput.
-    Receive {
+    /// Make this computer available for remote control.
+    Host {
         #[arg(long, default_value = "[::]:24801")]
         bind: SocketAddr,
         #[arg(long, default_value = "rflow-cert.der")]
@@ -45,10 +45,10 @@ enum Command {
         #[arg(long, default_value = "rflow-key.der")]
         key: PathBuf,
     },
-    /// Capture local input devices and send their events to a receiver.
-    Send {
-        #[arg(long)]
-        to: SocketAddr,
+    /// Control another computer with this computer's input devices.
+    Connect {
+        /// Host address, for example 192.168.1.50:24801.
+        target: SocketAddr,
         #[arg(long, default_value = "rflow-cert.der")]
         cert: PathBuf,
         #[arg(long, required = true)]
@@ -70,13 +70,13 @@ async fn main() -> Result<()> {
             println!("wrote {} and {}", cert.display(), key.display());
             Ok(())
         }
-        Command::Receive { bind, cert, key } => receive(bind, cert, key).await,
-        Command::Send {
-            to,
+        Command::Host { bind, cert, key } => receive(bind, cert, key).await,
+        Command::Connect {
+            target,
             cert,
             device,
             grab,
-        } => send(to, cert, device, grab).await,
+        } => send(target, cert, device, grab).await,
     }
 }
 
@@ -230,4 +230,47 @@ async fn read_reliable(stream: &mut RecvStream) -> Result<ReliableEvent> {
         .await
         .context("read reliable frame body")?;
     decode(&body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_command_parses_with_defaults() {
+        let cli = Cli::try_parse_from(["rflow", "host"]).unwrap();
+        match cli.command {
+            Command::Host { bind, cert, key } => {
+                assert_eq!(bind, "[::]:24801".parse().unwrap());
+                assert_eq!(cert, PathBuf::from("rflow-cert.der"));
+                assert_eq!(key, PathBuf::from("rflow-key.der"));
+            }
+            _ => panic!("expected host command"),
+        }
+    }
+
+    #[test]
+    fn connect_uses_positional_target() {
+        let cli = Cli::try_parse_from([
+            "rflow",
+            "connect",
+            "192.168.1.50:24801",
+            "--device",
+            "/dev/input/event1",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Connect { target, device, .. } => {
+                assert_eq!(target, "192.168.1.50:24801".parse().unwrap());
+                assert_eq!(device, vec![PathBuf::from("/dev/input/event1")]);
+            }
+            _ => panic!("expected connect command"),
+        }
+    }
+
+    #[test]
+    fn legacy_commands_are_not_exposed() {
+        assert!(Cli::try_parse_from(["rflow", "send"]).is_err());
+        assert!(Cli::try_parse_from(["rflow", "receive"]).is_err());
+    }
 }

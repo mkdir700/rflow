@@ -28,43 +28,42 @@ provide an `input` group, but group names and recommended udev policy vary.
 
 ## Quick start
 
-On the receiver, generate its identity once:
+On the computer you want to control, generate its identity once:
 
 ```bash
 rflow keygen
 ```
 
-Copy `rflow-cert.der` to the sender over a trusted channel. Never copy `rflow-key.der` away from
-the receiver. Start the receiver:
+Copy `rflow-cert.der` to the controlling computer over a trusted channel. Never copy
+`rflow-key.der` away from the host. Start the host:
 
 ```bash
-RUST_LOG=rflow=info rflow receive \
+RUST_LOG=rflow=info rflow host \
   --bind 0.0.0.0:24801 \
   --cert rflow-cert.der \
   --key rflow-key.der
 ```
 
-Find the keyboard and mouse event nodes on the sender:
+Find the keyboard and mouse event nodes on the controlling computer:
 
 ```bash
 ls -l /dev/input/by-id/
 ```
 
-Prefer stable `/dev/input/by-id/...-event-kbd` and `...-event-mouse` paths. Then send input:
+Prefer stable `/dev/input/by-id/...-event-kbd` and `...-event-mouse` paths. Then connect:
 
 ```bash
-RUST_LOG=rflow=info rflow send \
-  --to 192.168.1.50:24801 \
+RUST_LOG=rflow=info rflow connect 192.168.1.50:24801 \
   --cert rflow-cert.der \
   --device /dev/input/by-id/your-keyboard-event-kbd \
   --device /dev/input/by-id/your-mouse-event-mouse
 ```
 
 Without `--grab`, events affect both machines, which is the safest first test. Once SSH or another
-emergency recovery path is available, add `--grab` to make the sender exclusively consume those
+emergency recovery path is available, add `--grab` to make rflow exclusively consume those
 devices. Press Ctrl-C to stop when running without `--grab`. With grabbed keyboards, Ctrl-C is
-sent to the receiver, so stop `rflow` through SSH or another independent input device. Do not test
-`--grab` without that recovery path.
+sent to the host, so stop `rflow connect` through SSH or another independent input device. Do not
+test `--grab` without that recovery path.
 
 ## Latency design
 
