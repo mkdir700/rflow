@@ -119,6 +119,8 @@ fn write_identity_pair(
 }
 
 fn write_new_file(path: &Path, contents: &[u8], private: bool) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = private;
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

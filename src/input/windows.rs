@@ -22,11 +22,10 @@ use crate::{core::ScreenSize, platform::DetectedScreen};
 
 pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
-pub const REL_X: u16 = 0x00;
-pub const REL_Y: u16 = 0x01;
 const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum NativeCapturedEvent {
     Input {

@@ -310,7 +310,7 @@ impl ApplicationHandle {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn application_test_channel(
     snapshot: RuntimeSnapshot,
 ) -> (ApplicationHandle, mpsc::Receiver<AppCommand>) {
@@ -1584,6 +1584,7 @@ mod tests {
         runtime.shutdown().await.unwrap();
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn shutdown_terminates_an_active_supervisor() {
         let directory = tempfile::tempdir().unwrap();
