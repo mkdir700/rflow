@@ -2,8 +2,7 @@ use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use quinn::{
-    ClientConfig, Connection, Endpoint, EndpointConfig, ServerConfig, TokioRuntime,
-    TransportConfig, VarInt,
+    ClientConfig, Connection, Endpoint, ServerConfig, TransportConfig, VarInt,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
 use rustls::{
@@ -18,14 +17,6 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use crate::identity::{IdentityPaths, TLS_SERVER_NAME};
 
 const PAIRING_ALPN: &[u8] = b"rflow-pairing/1";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum TransportMode {
-    /// Native QUIC over UDP.
-    Quic,
-    /// QUIC UDP datagrams encapsulated in ICMP echo messages (Linux, IPv4).
-    Icmp,
-}
 
 #[derive(Debug)]
 struct PairingServerVerifier {
@@ -185,14 +176,6 @@ pub fn client_endpoint(bind: SocketAddr, cert_path: &Path) -> Result<Endpoint> {
 }
 
 pub fn pairing_server_endpoint(bind: SocketAddr, identity: &IdentityPaths) -> Result<Endpoint> {
-    pairing_server_endpoint_with_mode(bind, identity, TransportMode::Quic)
-}
-
-pub fn pairing_server_endpoint_with_mode(
-    bind: SocketAddr,
-    identity: &IdentityPaths,
-    mode: TransportMode,
-) -> Result<Endpoint> {
     let (certificate, private_key) = load_identity(identity)?;
     let provider = pairing_crypto_provider();
     let verifier = Arc::new(PairingClientVerifier {
@@ -207,18 +190,10 @@ pub fn pairing_server_endpoint_with_mode(
     let crypto = QuicServerConfig::try_from(tls).context("configure pairing QUIC server")?;
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(transport_config()?);
-    server_with_mode(config, bind, mode)
+    Endpoint::server(config, bind).context("bind pairing QUIC server")
 }
 
 pub fn pairing_client_endpoint(bind: SocketAddr, identity: &IdentityPaths) -> Result<Endpoint> {
-    pairing_client_endpoint_with_mode(bind, identity, TransportMode::Quic)
-}
-
-pub fn pairing_client_endpoint_with_mode(
-    bind: SocketAddr,
-    identity: &IdentityPaths,
-    mode: TransportMode,
-) -> Result<Endpoint> {
     let (certificate, private_key) = load_identity(identity)?;
     let provider = pairing_crypto_provider();
     let verifier = Arc::new(PairingServerVerifier {
@@ -234,39 +209,9 @@ pub fn pairing_client_endpoint_with_mode(
     let crypto = QuicClientConfig::try_from(tls).context("configure pairing QUIC client")?;
     let mut config = ClientConfig::new(Arc::new(crypto));
     config.transport_config(transport_config()?);
-    let mut endpoint = client_with_mode(bind, mode)?;
+    let mut endpoint = Endpoint::client(bind).context("bind pairing QUIC client")?;
     endpoint.set_default_client_config(config);
     Ok(endpoint)
-}
-
-fn server_with_mode(
-    config: ServerConfig,
-    bind: SocketAddr,
-    mode: TransportMode,
-) -> Result<Endpoint> {
-    match mode {
-        TransportMode::Quic => Endpoint::server(config, bind).context("bind pairing QUIC server"),
-        TransportMode::Icmp => Endpoint::new_with_abstract_socket(
-            EndpointConfig::default(),
-            Some(config),
-            crate::icmp::socket(bind, crate::icmp::Role::Server).context("bind ICMP tunnel")?,
-            Arc::new(TokioRuntime),
-        )
-        .context("create QUIC endpoint over ICMP"),
-    }
-}
-
-fn client_with_mode(bind: SocketAddr, mode: TransportMode) -> Result<Endpoint> {
-    match mode {
-        TransportMode::Quic => Endpoint::client(bind).context("bind pairing QUIC client"),
-        TransportMode::Icmp => Endpoint::new_with_abstract_socket(
-            EndpointConfig::default(),
-            None,
-            crate::icmp::socket(bind, crate::icmp::Role::Client).context("bind ICMP tunnel")?,
-            Arc::new(TokioRuntime),
-        )
-        .context("create QUIC endpoint over ICMP"),
-    }
 }
 
 pub fn peer_certificate(connection: &Connection) -> Result<Vec<u8>> {

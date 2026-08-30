@@ -18,28 +18,6 @@ of building a queue. Keys, mouse buttons, and wheel events use a reliable ordere
 
 Not included yet: LAN service discovery, GUI configuration, clipboard, or cloud synchronization.
 
-## ICMP tunnel transport
-
-On Linux/IPv4, QUIC packets can optionally be carried inside ICMP echo messages. Both sides must
-select the same carrier:
-
-```bash
-sudo setcap cap_net_raw=ep ./target/release/rflow
-./target/release/rflow host --transport icmp --bind 0.0.0.0:24801
-./target/release/rflow client --transport icmp 192.168.1.50:24801
-```
-
-The ICMP mode encapsulates rflow's UDP/QUIC datagrams; QUIC still provides TLS 1.3 encryption,
-mutual authentication, reliable streams, datagrams, congestion control, and pairing. It does not
-replace those properties with a home-grown protocol. The virtual UDP source and destination ports
-are included in every tunnel frame, so several rflow endpoints can share the ICMP carrier.
-
-Raw ICMP sockets require `CAP_NET_RAW` (or root). Prefer granting only that capability to the built
-binary, and repeat `setcap` after replacing it. ICMP is commonly filtered or rate-limited and can
-have worse latency than UDP; this mode is a fallback, not the default. It currently supports Linux
-and IPv4 only, so use an IPv4 target address. The normal QUIC transport remains unchanged and is
-selected with `--transport quic` (the default).
-
 ## Build
 
 ```bash

@@ -57,9 +57,6 @@ enum Command {
     Host {
         #[arg(long, default_value = "0.0.0.0:24801")]
         bind: SocketAddr,
-        /// Network carrier for QUIC packets.
-        #[arg(long, value_enum, default_value_t = transport::TransportMode::Quic)]
-        transport: transport::TransportMode,
         #[arg(long = "identity-cert", requires = "key")]
         cert: Option<PathBuf>,
         #[arg(long = "identity-key", requires = "cert")]
@@ -78,9 +75,6 @@ enum Command {
     Client {
         /// Host IP address or hostname, with optional port.
         target: ServerTarget,
-        /// Network carrier for QUIC packets; must match the host.
-        #[arg(long, value_enum, default_value_t = transport::TransportMode::Quic)]
-        transport: transport::TransportMode,
         #[arg(long = "identity-cert", requires = "identity_key")]
         identity_cert: Option<PathBuf>,
         #[arg(long = "identity-key", requires = "identity_cert")]
@@ -1112,7 +1106,6 @@ impl Command {
         Ok(match self {
             Command::Host {
                 bind,
-                transport,
                 cert,
                 key,
                 size,
@@ -1123,7 +1116,6 @@ impl Command {
                 ensure_identity(&identity)?;
                 AppCommand::StartHost(HostConfig {
                     bind,
-                    transport,
                     cert: identity.certificate,
                     key: identity.private_key,
                     size,
@@ -1135,7 +1127,6 @@ impl Command {
             }
             Command::Client {
                 target,
-                transport,
                 identity_cert,
                 identity_key,
                 server_cert,
@@ -1146,7 +1137,6 @@ impl Command {
                 ensure_identity(&identity)?;
                 AppCommand::StartClient(ClientConfig {
                     target,
-                    transport,
                     identity_cert: identity.certificate,
                     identity_key: identity.private_key,
                     server_cert,

@@ -1,5 +1,4 @@
 pub mod core;
-pub mod icmp;
 pub mod identity;
 pub(crate) mod input;
 pub mod layout;

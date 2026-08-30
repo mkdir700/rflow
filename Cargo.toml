@@ -2,7 +2,7 @@
 name = "rflow"
 version = "0.1.0"
 edition = "2024"
-description = "Low-latency keyboard and mouse sharing over QUIC, optionally carried by ICMP"
+description = "Low-latency Linux keyboard and mouse sharing over QUIC"
 license = "MIT"
 
 [dependencies]
@@ -23,8 +23,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-socket2 = { version = "0.6", features = ["all"] }
-
 evdev = "0.13"
 
 [target.'cfg(target_os = "windows")'.dependencies]
