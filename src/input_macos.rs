@@ -27,6 +27,7 @@ type CFMachPortRef = *mut c_void;
 type CFRunLoopRef = *mut c_void;
 type CFRunLoopSourceRef = *mut c_void;
 type CGEventTapProxy = *mut c_void;
+type CFStringRef = *const c_void;
 type CGEventTapCallback =
     Option<unsafe extern "C" fn(CGEventTapProxy, u32, CGEventRef, *mut c_void) -> CGEventRef>;
 
@@ -91,12 +92,25 @@ unsafe extern "C" {
     fn CGDisplayShowCursor(display: u32) -> i32;
     fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
     fn CGWarpMouseCursorPosition(position: CGPoint) -> i32;
+    fn _CGSDefaultConnection() -> i32;
+    fn CGSSetConnectionProperty(
+        connection: i32,
+        target_connection: i32,
+        key: CFStringRef,
+        value: *const c_void,
+    ) -> i32;
     fn CFRelease(value: *const c_void);
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     static kCFRunLoopCommonModes: *const c_void;
+    static kCFBooleanTrue: *const c_void;
+    fn CFStringCreateWithCString(
+        allocator: *const c_void,
+        text: *const i8,
+        encoding: u32,
+    ) -> CFStringRef;
     fn CFMachPortCreateRunLoopSource(
         allocator: *const c_void,
         port: CFMachPortRef,
@@ -384,6 +398,7 @@ impl Injector {
     }
 
     pub fn set_cursor_position(&mut self, x: i32, y: i32) -> Result<()> {
+        enable_background_cursor();
         check_cg_error(
             unsafe { CGDisplayShowCursor(CGMainDisplayID()) },
             "show macOS cursor",
@@ -467,6 +482,22 @@ impl Injector {
             modifier_flags(&self.modifiers),
             "create macOS mouse event",
         )
+    }
+}
+
+fn enable_background_cursor() {
+    let key = unsafe {
+        CFStringCreateWithCString(std::ptr::null(), c"SetsCursorInBackground".as_ptr(), 0)
+    };
+    if key.is_null() {
+        tracing::warn!("failed to create macOS background-cursor property name");
+        return;
+    }
+    let connection = unsafe { _CGSDefaultConnection() };
+    let error = unsafe { CGSSetConnectionProperty(connection, connection, key, kCFBooleanTrue) };
+    unsafe { CFRelease(key) };
+    if error != 0 {
+        tracing::warn!(error, "failed to enable macOS cursor in background process");
     }
 }
 
