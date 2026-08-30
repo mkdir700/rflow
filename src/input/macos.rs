@@ -63,12 +63,8 @@ unsafe extern "C" {
         virtual_key: u16,
         key_down: bool,
     ) -> CGEventRef;
-    fn CGEventCreateScrollWheelEvent(
-        source: *mut c_void,
-        units: u32,
-        wheel_count: u32,
-        ...
-    ) -> CGEventRef;
+    fn CGEventSetType(event: CGEventRef, event_type: u32);
+    fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
     fn CGEventPost(tap: u32, event: CGEventRef);
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventGetFlags(event: CGEventRef) -> u64;
@@ -137,6 +133,12 @@ const EVENT_SCROLL: u32 = 22;
 const EVENT_OTHER_DOWN: u32 = 25;
 const EVENT_OTHER_UP: u32 = 26;
 const EVENT_OTHER_DRAGGED: u32 = 27;
+const SCROLL_DELTA_AXIS_1: u32 = 11;
+const SCROLL_DELTA_AXIS_2: u32 = 12;
+const SCROLL_FIXED_DELTA_AXIS_1: u32 = 93;
+const SCROLL_FIXED_DELTA_AXIS_2: u32 = 94;
+const SCROLL_POINT_DELTA_AXIS_1: u32 = 96;
+const SCROLL_POINT_DELTA_AXIS_2: u32 = 97;
 const FLAG_CAPS_LOCK: u64 = 1 << 16;
 const FLAG_SHIFT: u64 = 1 << 17;
 const FLAG_CONTROL: u64 = 1 << 18;
@@ -529,9 +531,27 @@ impl Injector {
     }
 
     fn emit_scroll(&mut self, vertical: i32, horizontal: i32) -> Result<()> {
-        let event = unsafe {
-            CGEventCreateScrollWheelEvent(std::ptr::null_mut(), 1, 2, vertical, horizontal)
-        };
+        let event = unsafe { CGEventCreate(std::ptr::null_mut()) };
+        if event.is_null() {
+            bail!("create macOS scroll event");
+        }
+        unsafe {
+            CGEventSetType(event, EVENT_SCROLL);
+            set_scroll_axis(
+                event,
+                vertical,
+                SCROLL_DELTA_AXIS_1,
+                SCROLL_FIXED_DELTA_AXIS_1,
+                SCROLL_POINT_DELTA_AXIS_1,
+            );
+            set_scroll_axis(
+                event,
+                horizontal,
+                SCROLL_DELTA_AXIS_2,
+                SCROLL_FIXED_DELTA_AXIS_2,
+                SCROLL_POINT_DELTA_AXIS_2,
+            );
+        }
         post_with_flags_and_release(
             event,
             modifier_flags(&self.modifiers),
@@ -557,6 +577,21 @@ impl Injector {
             modifier_flags(&self.modifiers),
             "create macOS mouse event",
         )
+    }
+}
+
+unsafe fn set_scroll_axis(
+    event: CGEventRef,
+    delta: i32,
+    line_field: u32,
+    fixed_field: u32,
+    point_field: u32,
+) {
+    let delta = i64::from(delta);
+    unsafe {
+        CGEventSetIntegerValueField(event, line_field, delta);
+        CGEventSetIntegerValueField(event, fixed_field, delta << 16);
+        CGEventSetIntegerValueField(event, point_field, delta * 10);
     }
 }
 
@@ -861,5 +896,36 @@ mod tests {
         assert_eq!(drag_event(&HashSet::from([272])), (EVENT_LEFT_DRAGGED, 0));
         assert_eq!(drag_event(&HashSet::from([273])), (EVENT_RIGHT_DRAGGED, 1));
         assert_eq!(drag_event(&HashSet::from([275])), (EVENT_OTHER_DRAGGED, 3));
+    }
+
+    #[test]
+    fn scroll_axis_preserves_both_delta_signs() {
+        for delta in [-1, 1] {
+            let event = unsafe { CGEventCreate(std::ptr::null_mut()) };
+            assert!(!event.is_null());
+            unsafe {
+                CGEventSetType(event, EVENT_SCROLL);
+                set_scroll_axis(
+                    event,
+                    delta,
+                    SCROLL_DELTA_AXIS_1,
+                    SCROLL_FIXED_DELTA_AXIS_1,
+                    SCROLL_POINT_DELTA_AXIS_1,
+                );
+                assert_eq!(
+                    CGEventGetIntegerValueField(event, SCROLL_DELTA_AXIS_1),
+                    i64::from(delta)
+                );
+                assert_eq!(
+                    CGEventGetIntegerValueField(event, SCROLL_FIXED_DELTA_AXIS_1),
+                    i64::from(delta) << 16
+                );
+                assert_eq!(
+                    CGEventGetIntegerValueField(event, SCROLL_POINT_DELTA_AXIS_1),
+                    i64::from(delta) * 10
+                );
+                CFRelease(event);
+            }
+        }
     }
 }
