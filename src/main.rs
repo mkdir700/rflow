@@ -48,7 +48,7 @@ enum Command {
     },
     /// Own the physical keyboard/mouse and route them across screens.
     Host {
-        #[arg(long, default_value = "[::]:24801")]
+        #[arg(long, default_value = "0.0.0.0:24801")]
         bind: SocketAddr,
         #[arg(long = "identity-cert", requires = "key")]
         cert: Option<PathBuf>,
@@ -899,9 +899,13 @@ mod tests {
     #[test]
     fn host_defaults_to_automatic_screen_and_devices() {
         let cli = Cli::try_parse_from(["rflow", "host", "--direction", "right"]).unwrap();
-        let Command::Host { size, device, .. } = cli.command else {
+        let Command::Host {
+            bind, size, device, ..
+        } = cli.command
+        else {
             panic!("expected host command")
         };
+        assert_eq!(bind, "0.0.0.0:24801".parse().unwrap());
         assert_eq!(size, None);
         assert!(device.is_empty());
     }

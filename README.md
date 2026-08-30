@@ -52,9 +52,11 @@ Start the host. rflow detects the host's active screens, logical dimensions, key
 automatically:
 
 ```bash
-RUST_LOG=rflow=info rflow host \
-  --bind 0.0.0.0:24801
+RUST_LOG=rflow=info rflow host
 ```
+
+By default the host listens on `0.0.0.0:24801`, making it reachable over the local network. Use
+`--bind 127.0.0.1:24801` when the service should only be available on the same machine.
 
 On Linux, unreadable evdev devices produce a diagnostic listing the affected paths and permission
 remedy. `--device PATH` remains an advanced capture override. Use `rflow layout set-size` for a
