@@ -142,6 +142,15 @@ impl DesktopSession {
     }
 
     fn handle_physical_input(&mut self, event: InputEvent) -> Vec<SessionEffect> {
+        if matches!(
+            event,
+            InputEvent::Key {
+                key,
+                state: ButtonState::Repeated,
+            } if !self.physical_held.contains(&HeldInput::Key(key))
+        ) {
+            return Vec::new();
+        }
         self.observe_physical(event);
         match self.control {
             ControlTarget::Local => {
@@ -289,6 +298,33 @@ mod tests {
                 SessionEffect::SendRemote(key),
                 SessionEffect::ControlChanged(ControlTarget::Remote),
             ]
+        );
+    }
+
+    #[test]
+    fn orphan_key_repeat_at_capture_start_is_not_injected() {
+        let mut session = host();
+        let enter_repeat = InputEvent::Key {
+            key: Key(28),
+            state: ButtonState::Repeated,
+        };
+
+        assert_eq!(
+            session.handle(SessionEvent::PhysicalInput(enter_repeat)),
+            Vec::<SessionEffect>::new()
+        );
+
+        let enter_down = InputEvent::Key {
+            key: Key(28),
+            state: ButtonState::Pressed,
+        };
+        assert_eq!(
+            session.handle(SessionEvent::PhysicalInput(enter_down)),
+            vec![SessionEffect::InjectLocal(enter_down)]
+        );
+        assert_eq!(
+            session.handle(SessionEvent::PhysicalInput(enter_repeat)),
+            vec![SessionEffect::InjectLocal(enter_repeat)]
         );
     }
 
