@@ -526,10 +526,12 @@ pub enum TopologyRoute {
 }
 
 const EDGE_BARRIER_DISTANCE: i32 = 8;
+const EDGE_SWITCH_DELAY_MICROS: u64 = 250_000;
 
 struct EdgeBarrier<K> {
     edge: Option<K>,
     distance: i32,
+    since_micros: Option<u64>,
 }
 
 impl<K: Copy + Eq> EdgeBarrier<K> {
@@ -547,9 +549,34 @@ impl<K: Copy + Eq> EdgeBarrier<K> {
         }
     }
 
+    fn wait_elapsed(&mut self, edge: K, timestamp_micros: u64) -> bool {
+        if self.edge != Some(edge) {
+            self.edge = Some(edge);
+            self.distance = 0;
+            self.since_micros = Some(timestamp_micros);
+            return false;
+        }
+        let since = self.since_micros.get_or_insert(timestamp_micros);
+        if timestamp_micros.saturating_sub(*since) >= EDGE_SWITCH_DELAY_MICROS {
+            self.reset();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn start_wait(&mut self, edge: K, timestamp_micros: u64) {
+        if self.edge != Some(edge) || self.since_micros.is_none() {
+            self.edge = Some(edge);
+            self.distance = 0;
+            self.since_micros = Some(timestamp_micros);
+        }
+    }
+
     fn reset(&mut self) {
         self.edge = None;
         self.distance = 0;
+        self.since_micros = None;
     }
 }
 
@@ -558,6 +585,7 @@ impl<K> Default for EdgeBarrier<K> {
         Self {
             edge: None,
             distance: 0,
+            since_micros: None,
         }
     }
 }
@@ -628,6 +656,19 @@ impl TopologyRouter {
     }
 
     pub fn route_motion(&mut self, dx: i32, dy: i32) -> TopologyRoute {
+        self.route_motion_inner(dx, dy, None)
+    }
+
+    pub fn route_motion_at(&mut self, dx: i32, dy: i32, timestamp_micros: u64) -> TopologyRoute {
+        self.route_motion_inner(dx, dy, Some(timestamp_micros))
+    }
+
+    fn route_motion_inner(
+        &mut self,
+        dx: i32,
+        dy: i32,
+        timestamp_micros: Option<u64>,
+    ) -> TopologyRoute {
         let size = self.screen_size(&self.active);
         let next_x = self.x.saturating_add(dx);
         let next_y = self.y.saturating_add(dy);
@@ -651,7 +692,11 @@ impl TopologyRouter {
                 Edge::Top => dy.saturating_abs(),
                 Edge::Bottom => dy,
             };
-            if !self.barrier.push(edge, outward) {
+            let can_cross = match timestamp_micros {
+                Some(timestamp_micros) => self.barrier.wait_elapsed(edge, timestamp_micros),
+                None => self.barrier.push(edge, outward),
+            };
+            if !can_cross {
                 self.x = next_x.clamp(0, size.width - 1);
                 self.y = next_y.clamp(0, size.height - 1);
                 return TopologyRoute::Stay {
@@ -704,7 +749,24 @@ impl TopologyRouter {
                 y,
             };
         }
-        self.barrier.reset();
+        let reached_linked_edge = if next_x <= 0 && dx < 0 {
+            Some(Edge::Left)
+        } else if next_x >= size.width - 1 && dx > 0 {
+            Some(Edge::Right)
+        } else if next_y <= 0 && dy < 0 {
+            Some(Edge::Top)
+        } else if next_y >= size.height - 1 && dy > 0 {
+            Some(Edge::Bottom)
+        } else {
+            None
+        };
+        if let (Some(timestamp_micros), Some(edge)) = (timestamp_micros, reached_linked_edge)
+            && self.linked_edge(edge).is_some()
+        {
+            self.barrier.start_wait(edge, timestamp_micros);
+        } else {
+            self.barrier.reset();
+        }
         self.x = next_x.clamp(0, size.width - 1);
         self.y = next_y.clamp(0, size.height - 1);
         TopologyRoute::Stay {

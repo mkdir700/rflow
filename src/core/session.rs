@@ -295,7 +295,7 @@ impl DesktopSession {
         } = router
         {
             let previous = router.active_screen().clone();
-            return match router.route_motion(motion.dx, motion.dy) {
+            return match router.route_motion_at(motion.dx, motion.dy, motion.timestamp_micros) {
                 TopologyRoute::Stay { screen_id, dx, dy } if screen_id == *local_screen => {
                     vec![SessionEffect::InjectLocalMotion { dx, dy }]
                 }
@@ -493,9 +493,13 @@ mod tests {
     }
 
     fn motion(sequence: u64, dx: i32, dy: i32) -> Motion {
+        motion_at(sequence, 0, dx, dy)
+    }
+
+    fn motion_at(sequence: u64, timestamp_micros: u64, dx: i32, dy: i32) -> Motion {
         Motion {
             sequence,
-            timestamp_micros: 0,
+            timestamp_micros,
             dx,
             dy,
         }
@@ -737,7 +741,8 @@ mod tests {
         let mut session =
             DesktopSession::host_topology(&initial_topology, ScreenId("local".into()), 99, 50)
                 .unwrap();
-        session.handle(SessionEvent::PhysicalMotion(motion(1, 8, 0)));
+        session.handle(SessionEvent::PhysicalMotion(motion_at(1, 1_000_000, 8, 0)));
+        session.handle(SessionEvent::PhysicalMotion(motion_at(2, 1_250_000, 1, 0)));
         assert_eq!(session.snapshot().control, ControlTarget::Remote);
 
         let effects = session.replace_topology(&topology(false)).unwrap();
@@ -752,6 +757,39 @@ mod tests {
             ]
         );
         assert_eq!(session.snapshot().control, ControlTarget::Local);
+    }
+
+    #[test]
+    fn rapid_motion_must_remain_at_the_edge_for_the_switch_delay() {
+        let mut session =
+            DesktopSession::host_topology(&topology(true), ScreenId("local".into()), 50, 50)
+                .unwrap();
+
+        assert_eq!(
+            session.handle(SessionEvent::PhysicalMotion(motion_at(
+                1, 1_000_000, 100, 0
+            ))),
+            vec![SessionEffect::InjectLocalMotion { dx: 100, dy: 0 }]
+        );
+        assert_eq!(
+            session.handle(SessionEvent::PhysicalMotion(motion_at(
+                2, 1_001_000, 100, 0
+            ))),
+            vec![SessionEffect::InjectLocalMotion { dx: 100, dy: 0 }]
+        );
+        assert_eq!(session.snapshot().control, ControlTarget::Local);
+
+        assert_eq!(
+            session.handle(SessionEvent::PhysicalMotion(motion_at(3, 1_251_000, 1, 0))),
+            vec![
+                SessionEffect::EnterScreen {
+                    screen_id: ScreenId("remote".into()),
+                    x: 1,
+                    y: 50,
+                },
+                SessionEffect::ControlChanged(ControlTarget::Remote),
+            ]
+        );
     }
 
     #[test]
@@ -779,16 +817,19 @@ mod tests {
         });
         let mut session =
             DesktopSession::host_topology(&topology, ScreenId("local".into()), 99, 50).unwrap();
-        session.handle(SessionEvent::PhysicalMotion(motion(1, 8, 0)));
+        session.handle(SessionEvent::PhysicalMotion(motion_at(1, 1_000_000, 8, 0)));
+        session.handle(SessionEvent::PhysicalMotion(motion_at(2, 1_250_000, 1, 0)));
         assert_eq!(
-            session.handle(SessionEvent::PhysicalMotion(motion(2, 100, 0))),
+            session.handle(SessionEvent::PhysicalMotion(motion_at(
+                3, 1_251_000, 100, 0
+            ))),
             vec![SessionEffect::SendScreenMotion {
                 screen_id: ScreenId("remote".into()),
-                motion: motion(2, 100, 0),
+                motion: motion_at(3, 1_251_000, 100, 0),
             }]
         );
         assert_eq!(
-            session.handle(SessionEvent::PhysicalMotion(motion(3, 8, 0))),
+            session.handle(SessionEvent::PhysicalMotion(motion_at(4, 1_501_000, 1, 0))),
             vec![
                 SessionEffect::ReleaseScreen {
                     screen_id: ScreenId("remote".into()),
