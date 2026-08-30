@@ -34,6 +34,10 @@ use rflow::runtime::{PlacementOptionSummary, PlacementScreenSummary};
 #[derive(Debug, Parser)]
 #[command(version, about = "Low-latency virtual KVM over QUIC")]
 struct Cli {
+    /// Increase runtime log detail (-v for debug, -vv for trace).
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -193,10 +197,11 @@ enum PeersCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(runtime_log_filter(cli.verbose))
         .init();
-    match Cli::parse().command {
+    match cli.command {
         Command::Keygen { cert, key, force } => {
             transport::generate_identity(&cert, &key, force)?;
             println!("wrote {} and {}", cert.display(), key.display());
@@ -210,6 +215,16 @@ async fn main() -> Result<()> {
         } => run_layout(command, watch, json).await,
         command => run_session(command).await,
     }
+}
+
+fn runtime_log_filter(verbose: u8) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(match verbose {
+            0 => "error",
+            1 => "rflow=debug",
+            _ => "rflow=trace",
+        })
+    })
 }
 
 async fn run_layout(command: Option<LayoutSubcommand>, watch: bool, json: bool) -> Result<()> {
@@ -1111,6 +1126,15 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verbosity_is_a_repeatable_global_runtime_option() {
+        let before = Cli::try_parse_from(["rflow", "-v", "host"]).unwrap();
+        assert_eq!(before.verbose, 1);
+
+        let after = Cli::try_parse_from(["rflow", "client", "desktop.local", "-vv"]).unwrap();
+        assert_eq!(after.verbose, 2);
+    }
 
     #[tokio::test]
     async fn offline_layout_read_does_not_require_management_socket() {

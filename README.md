@@ -52,8 +52,12 @@ Start the host. rflow detects the host's active screens, logical dimensions, key
 automatically:
 
 ```bash
-RUST_LOG=rflow=info rflow host
+rflow host
 ```
+
+Add `-v` for debug logs or `-vv` for full trace logs when diagnosing a runtime problem. The option
+can appear before or after the subcommand; an explicit `RUST_LOG` value remains available as an
+advanced override.
 
 By default the host listens on `0.0.0.0:24801`, making it reachable over the local network. Use
 `--bind 127.0.0.1:24801` when the service should only be available on the same machine.
@@ -62,10 +66,10 @@ On Linux, unreadable evdev devices produce a diagnostic listing the affected pat
 remedy. `--device PATH` remains an advanced capture override. Use `rflow layout set-size` for a
 persistent logical-size override.
 
-On the client screen, connect to the host:
+On the client screen, connect to the host (use `-v` while diagnosing a connection):
 
 ```bash
-RUST_LOG=rflow=info rflow client 192.168.1.50 \
+rflow client 192.168.1.50 -v \
   --retry-for 120
 ```
 
