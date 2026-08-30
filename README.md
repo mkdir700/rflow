@@ -40,8 +40,6 @@ have worse latency than UDP; this mode is a fallback, not the default. It curren
 and IPv4 only, so use an IPv4 target address. The normal QUIC transport remains unchanged and is
 selected by default on the client. A host listens on both carriers by default; use
 `--transport quic` or `--transport icmp` on the host to isolate one carrier during testing.
-When the default dual mode cannot open a raw ICMP socket, the host logs a warning and continues
-with QUIC only. Explicit `--transport icmp` remains strict and reports the permission error.
 
 ## Build
 

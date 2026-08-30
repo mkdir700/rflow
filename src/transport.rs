@@ -225,32 +225,18 @@ pub fn pairing_server_endpoints(
     identity: &IdentityPaths,
     mode: HostTransportMode,
 ) -> Result<Vec<(TransportMode, Endpoint)>> {
-    create_server_endpoints(mode, |mode| {
-        pairing_server_endpoint_with_mode(bind, identity, mode)
-    })
-}
-
-fn create_server_endpoints<T>(
-    mode: HostTransportMode,
-    mut create: impl FnMut(TransportMode) -> Result<T>,
-) -> Result<Vec<(TransportMode, T)>> {
-    match mode {
-        HostTransportMode::Both => {
-            let mut endpoints = vec![(TransportMode::Quic, create(TransportMode::Quic)?)];
-            match create(TransportMode::Icmp) {
-                Ok(endpoint) => endpoints.push((TransportMode::Icmp, endpoint)),
-                Err(error) => {
-                    tracing::warn!(
-                        ?error,
-                        "ICMP transport unavailable; continuing with QUIC only"
-                    )
-                }
-            }
-            Ok(endpoints)
-        }
-        HostTransportMode::Quic => Ok(vec![(TransportMode::Quic, create(TransportMode::Quic)?)]),
-        HostTransportMode::Icmp => Ok(vec![(TransportMode::Icmp, create(TransportMode::Icmp)?)]),
-    }
+    let modes: &[TransportMode] = match mode {
+        HostTransportMode::Both => &[TransportMode::Quic, TransportMode::Icmp],
+        HostTransportMode::Quic => &[TransportMode::Quic],
+        HostTransportMode::Icmp => &[TransportMode::Icmp],
+    };
+    modes
+        .iter()
+        .copied()
+        .map(|mode| {
+            pairing_server_endpoint_with_mode(bind, identity, mode).map(|endpoint| (mode, endpoint))
+        })
+        .collect()
 }
 
 pub fn pairing_client_endpoint(bind: SocketAddr, identity: &IdentityPaths) -> Result<Endpoint> {
@@ -417,16 +403,5 @@ mod tests {
 
         assert_eq!(peer_certificate(&sending).unwrap(), server_certificate);
         assert_eq!(peer_certificate(&receiving).unwrap(), client_certificate);
-    }
-
-    #[test]
-    fn both_mode_keeps_quic_when_icmp_is_unavailable() {
-        let endpoints = create_server_endpoints(HostTransportMode::Both, |mode| match mode {
-            TransportMode::Quic => Ok("quic"),
-            TransportMode::Icmp => anyhow::bail!("CAP_NET_RAW unavailable"),
-        })
-        .unwrap();
-
-        assert_eq!(endpoints, vec![(TransportMode::Quic, "quic")]);
     }
 }
