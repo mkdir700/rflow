@@ -288,6 +288,11 @@ async fn submit_pairing_decision(request_id: PairingRequestId, accepted: bool) -
 async fn run_session(command: Command) -> Result<()> {
     let app_command = command.into_app_command()?;
     let is_host = matches!(app_command, AppCommand::StartHost(_));
+    let (local_screen, mut remote_screen) = match &app_command {
+        AppCommand::StartHost(config) => (config.device_name.clone(), "remote-device".to_owned()),
+        AppCommand::StartClient(config) => (config.device_name.clone(), config.target.to_string()),
+        _ => unreachable!("session startup requires host or client command"),
+    };
 
     let mut runtime = RuntimeHandle::spawn(Arc::new(TracingDiagnostics))?;
     let management = if is_host {
@@ -304,6 +309,7 @@ async fn run_session(command: Command) -> Result<()> {
     runtime.send(app_command).await?;
     let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::channel(4);
     let mut fault = None;
+    let mut previous_control = None;
     loop {
         tokio::select! {
             event = runtime.next_event() => match event {
@@ -314,8 +320,23 @@ async fn run_session(command: Command) -> Result<()> {
                     }
                 }
                 Some(AppEvent::PeerChanged(peer)) => tracing::info!(?peer, "peer changed"),
+                Some(AppEvent::PeerIdentified(peer)) => {
+                    remote_screen = peer.display_name;
+                }
                 Some(AppEvent::ControlChanged(control)) => {
-                    tracing::info!(?control, "input control changed")
+                    if let Some(transition) = screen_transition(
+                        previous_control,
+                        control,
+                        &local_screen,
+                        &remote_screen,
+                    ) {
+                        match transition.action {
+                            "enter" => tracing::info!(from = %transition.from, to = %transition.to, "enter screen"),
+                            "leave" => tracing::info!(from = %transition.from, to = %transition.to, "leave screen"),
+                            _ => unreachable!(),
+                        }
+                    }
+                    previous_control = Some(control);
                 }
                 Some(AppEvent::ConfigChanged(_)) => {}
                 Some(AppEvent::PairingRequested(request)) => {
@@ -400,6 +421,38 @@ async fn run_session(command: Command) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ScreenTransition<'a> {
+    action: &'static str,
+    from: &'a str,
+    to: &'a str,
+}
+
+fn screen_transition<'a>(
+    previous: Option<rflow::core::ControlTarget>,
+    current: rflow::core::ControlTarget,
+    local: &'a str,
+    remote: &'a str,
+) -> Option<ScreenTransition<'a>> {
+    match (previous, current) {
+        (Some(rflow::core::ControlTarget::Local), rflow::core::ControlTarget::Remote) => {
+            Some(ScreenTransition {
+                action: "leave",
+                from: local,
+                to: remote,
+            })
+        }
+        (Some(rflow::core::ControlTarget::Remote), rflow::core::ControlTarget::Local) => {
+            Some(ScreenTransition {
+                action: "enter",
+                from: remote,
+                to: local,
+            })
+        }
+        _ => None,
+    }
+}
+
 impl Command {
     fn into_app_command(self) -> Result<AppCommand> {
         Ok(match self {
@@ -459,6 +512,45 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_transitions_name_both_screens_and_boundary_action() {
+        assert_eq!(
+            screen_transition(
+                Some(rflow::core::ControlTarget::Local),
+                rflow::core::ControlTarget::Remote,
+                "linux-desktop",
+                "macmini",
+            ),
+            Some(ScreenTransition {
+                action: "leave",
+                from: "linux-desktop",
+                to: "macmini",
+            })
+        );
+        assert_eq!(
+            screen_transition(
+                Some(rflow::core::ControlTarget::Remote),
+                rflow::core::ControlTarget::Local,
+                "linux-desktop",
+                "macmini",
+            ),
+            Some(ScreenTransition {
+                action: "enter",
+                from: "macmini",
+                to: "linux-desktop",
+            })
+        );
+        assert_eq!(
+            screen_transition(
+                None,
+                rflow::core::ControlTarget::Local,
+                "linux-desktop",
+                "macmini",
+            ),
+            None
+        );
+    }
 
     #[test]
     fn host_parses_all_direction_names() {

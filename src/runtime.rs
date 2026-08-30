@@ -135,6 +135,7 @@ pub struct AppFault {
 pub enum AppEvent {
     StatusChanged(RuntimeStatus),
     PeerChanged(Option<SocketAddr>),
+    PeerIdentified(PeerSummary),
     ControlChanged(ControlTarget),
     ConfigChanged(Box<AppConfig>),
     PairingRequested(Box<PairingRequestSummary>),
@@ -150,6 +151,7 @@ pub enum AppEvent {
 pub struct RuntimeSnapshot {
     pub status: RuntimeStatus,
     pub peer: Option<SocketAddr>,
+    pub peer_device: Option<PeerSummary>,
     pub control: Option<ControlTarget>,
     pub config: AppConfig,
     pub fault: Option<AppFault>,
@@ -162,6 +164,7 @@ impl Default for RuntimeSnapshot {
         Self {
             status: RuntimeStatus::Stopped,
             peer: None,
+            peer_device: None,
             control: None,
             config: AppConfig::default(),
             fault: None,
@@ -195,6 +198,7 @@ impl AppEventBus {
                 snapshot.status = *status;
                 if *status == RuntimeStatus::Starting {
                     snapshot.peer = None;
+                    snapshot.peer_device = None;
                     snapshot.control = None;
                     snapshot.fault = None;
                 } else if matches!(
@@ -206,7 +210,13 @@ impl AppEventBus {
                     snapshot.control = None;
                 }
             }
-            AppEvent::PeerChanged(peer) => snapshot.peer = *peer,
+            AppEvent::PeerChanged(peer) => {
+                snapshot.peer = *peer;
+                if peer.is_none() {
+                    snapshot.peer_device = None;
+                }
+            }
+            AppEvent::PeerIdentified(peer) => snapshot.peer_device = Some(peer.clone()),
             AppEvent::ControlChanged(control) => snapshot.control = Some(*control),
             AppEvent::ConfigChanged(config) => snapshot.config = (**config).clone(),
             AppEvent::PairingRequested(request) => snapshot.pairing = Some((**request).clone()),
@@ -701,6 +711,12 @@ async fn authorize_host_peer(
     let client_message: PairingMessage = read_typed_frame(&mut receive).await?;
     let (client_name, client_material) =
         validate_pairing_hello(client_message, PairingRole::Client, peer_certificate)?;
+    events
+        .send(AppEvent::PeerIdentified(PeerSummary {
+            device_id: DeviceId::from_certificate(&client_material.certificate),
+            display_name: client_name.clone(),
+        }))
+        .await;
     let server_material = PairingMaterial::generate(PairingRole::Server, local_certificate)?;
     write_typed_frame(
         &mut send,
@@ -1193,6 +1209,12 @@ async fn authorize_server_peer(
     };
     let (server_name, server_material) =
         validate_pairing_hello(server_message, PairingRole::Server, peer_certificate)?;
+    events
+        .send(AppEvent::PeerIdentified(PeerSummary {
+            device_id: DeviceId::from_certificate(&server_material.certificate),
+            display_name: server_name.clone(),
+        }))
+        .await;
     let proof = pairing_proof(&server_material, &client_material)?;
     let endpoint = config.target.to_string();
     let verification = trust.verify_endpoint(&endpoint, &server_material.certificate);
@@ -1494,6 +1516,7 @@ mod tests {
             RuntimeSnapshot {
                 status: RuntimeStatus::Faulted,
                 peer: None,
+                peer_device: None,
                 control: None,
                 config: AppConfig::default(),
                 fault: Some(fault),
@@ -1730,6 +1753,14 @@ mod tests {
         let (server_authorized, server_connection) = reconnect_server_task.await.unwrap();
         let (client_authorized, client_connection) = reconnect_client_task.await.unwrap();
         assert!(server_authorized && client_authorized);
+        assert!(matches!(
+            reconnect_server_event_rx.try_recv(),
+            Ok(AppEvent::PeerIdentified(PeerSummary { display_name, .. })) if display_name == "macmini"
+        ));
+        assert!(matches!(
+            reconnect_client_event_rx.try_recv(),
+            Ok(AppEvent::PeerIdentified(PeerSummary { display_name, .. })) if display_name == "linux-desktop"
+        ));
         assert!(reconnect_server_event_rx.try_recv().is_err());
         assert!(reconnect_client_event_rx.try_recv().is_err());
         drop((
