@@ -1,4 +1,5 @@
 pub mod core;
+pub mod identity;
 #[cfg(target_os = "linux")]
 pub(crate) mod input;
 #[cfg(target_os = "windows")]
@@ -12,4 +13,5 @@ compile_error!("rflow currently supports Linux, Windows, and macOS");
 pub mod platform;
 pub mod protocol;
 pub mod runtime;
+pub mod target;
 pub mod transport;

@@ -1,13 +1,15 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use rflow::{
     core::{ScreenDirection, ScreenSize},
+    identity::{ensure_identity, resolve_identity_paths},
     runtime::{
         AppCommand, AppEvent, ClientConfig, HostConfig, RuntimeHandle, RuntimeStatus,
         TracingDiagnostics,
     },
+    target::ServerTarget,
     transport,
 };
 
@@ -33,10 +35,10 @@ enum Command {
     Host {
         #[arg(long, default_value = "[::]:24801")]
         bind: SocketAddr,
-        #[arg(long, default_value = "rflow-cert.der")]
-        cert: PathBuf,
-        #[arg(long, default_value = "rflow-key.der")]
-        key: PathBuf,
+        #[arg(long = "identity-cert", requires = "key")]
+        cert: Option<PathBuf>,
+        #[arg(long = "identity-key", requires = "cert")]
+        key: Option<PathBuf>,
         /// Size of this screen in logical cursor coordinates.
         #[arg(long)]
         size: ScreenSize,
@@ -49,10 +51,15 @@ enum Command {
     },
     /// Join a host as a remotely controlled screen.
     Client {
-        /// Host address, for example 192.168.1.50:24801.
-        target: SocketAddr,
-        #[arg(long, default_value = "rflow-cert.der")]
-        cert: PathBuf,
+        /// Host IP address or hostname, with optional port.
+        target: ServerTarget,
+        #[arg(long = "identity-cert", requires = "identity_key")]
+        identity_cert: Option<PathBuf>,
+        #[arg(long = "identity-key", requires = "identity_cert")]
+        identity_key: Option<PathBuf>,
+        /// Explicitly pin the server certificate until interactive pairing is available.
+        #[arg(long)]
+        server_cert: Option<PathBuf>,
         /// Override automatic screen-size detection.
         #[arg(long)]
         size: Option<ScreenSize>,
@@ -78,7 +85,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_session(command: Command) -> Result<()> {
-    let app_command = command.into_app_command();
+    let app_command = command.into_app_command()?;
 
     let mut runtime = RuntimeHandle::spawn(Arc::new(TracingDiagnostics))?;
     runtime.send(app_command).await?;
@@ -117,8 +124,8 @@ async fn run_session(command: Command) -> Result<()> {
 }
 
 impl Command {
-    fn into_app_command(self) -> AppCommand {
-        match self {
+    fn into_app_command(self) -> Result<AppCommand> {
+        Ok(match self {
             Command::Host {
                 bind,
                 cert,
@@ -126,27 +133,42 @@ impl Command {
                 size,
                 device,
                 direction,
-            } => AppCommand::StartHost(HostConfig {
-                bind,
-                cert,
-                key,
-                size,
-                devices: device,
-                direction,
-            }),
+            } => {
+                let identity = resolve_identity_paths(cert, key)?;
+                ensure_identity(&identity)?;
+                AppCommand::StartHost(HostConfig {
+                    bind,
+                    cert: identity.certificate,
+                    key: identity.private_key,
+                    size,
+                    devices: device,
+                    direction,
+                })
+            }
             Command::Client {
                 target,
-                cert,
+                identity_cert,
+                identity_key,
+                server_cert,
                 size,
                 retry_for,
-            } => AppCommand::StartClient(ClientConfig {
-                target,
-                cert,
-                size,
-                retry_for: Duration::from_secs(retry_for),
-            }),
+            } => {
+                let server_cert = server_cert.context(
+                    "--server-cert is required until interactive device pairing is implemented",
+                )?;
+                let identity = resolve_identity_paths(identity_cert, identity_key)?;
+                ensure_identity(&identity)?;
+                AppCommand::StartClient(ClientConfig {
+                    target,
+                    identity_cert: identity.certificate,
+                    identity_key: identity.private_key,
+                    server_cert,
+                    size,
+                    retry_for: Duration::from_secs(retry_for),
+                })
+            }
             Command::Keygen { .. } => unreachable!("keygen is handled before session startup"),
-        }
+        })
     }
 }
 
@@ -186,6 +208,79 @@ mod tests {
     }
 
     #[test]
+    fn host_defaults_to_automatic_identity() {
+        let cli = Cli::try_parse_from([
+            "rflow",
+            "host",
+            "--size",
+            "1920x1080",
+            "--direction",
+            "right",
+        ])
+        .unwrap();
+        let Command::Host { cert, key, .. } = cli.command else {
+            panic!("expected host command")
+        };
+        assert_eq!(cert, None);
+        assert_eq!(key, None);
+    }
+
+    #[test]
+    fn client_separates_local_identity_from_server_trust_anchor() {
+        let cli = Cli::try_parse_from([
+            "rflow",
+            "client",
+            "desktop.local",
+            "--identity-cert",
+            "client-cert.der",
+            "--identity-key",
+            "client-key.der",
+            "--server-cert",
+            "server-cert.der",
+        ])
+        .unwrap();
+        let Command::Client {
+            identity_cert,
+            identity_key,
+            server_cert,
+            ..
+        } = cli.command
+        else {
+            panic!("expected client command")
+        };
+        assert_eq!(identity_cert, Some(PathBuf::from("client-cert.der")));
+        assert_eq!(identity_key, Some(PathBuf::from("client-key.der")));
+        assert_eq!(server_cert, Some(PathBuf::from("server-cert.der")));
+    }
+
+    #[test]
+    fn identity_override_requires_certificate_and_key_together() {
+        assert!(
+            Cli::try_parse_from([
+                "rflow",
+                "host",
+                "--size",
+                "1920x1080",
+                "--direction",
+                "right",
+                "--identity-cert",
+                "identity-cert.der",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rflow",
+                "client",
+                "desktop.local",
+                "--identity-key",
+                "identity-key.der",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn host_rejects_retired_right_option() {
         assert!(Cli::try_parse_from(["rflow", "host", "--size", "1920x1080", "--right"]).is_err());
     }
@@ -221,6 +316,24 @@ mod tests {
             }
             _ => panic!("expected client command"),
         }
+    }
+
+    #[test]
+    fn client_accepts_hostname_without_port() {
+        let cli = Cli::try_parse_from(["rflow", "client", "linux-desktop.local"]).unwrap();
+        let Command::Client { target, .. } = cli.command else {
+            panic!("expected client command")
+        };
+        assert_eq!(target.to_string(), "linux-desktop.local:24801");
+    }
+
+    #[test]
+    fn client_accepts_ip_without_port() {
+        let cli = Cli::try_parse_from(["rflow", "client", "192.168.1.50"]).unwrap();
+        let Command::Client { target, .. } = cli.command else {
+            panic!("expected client command")
+        };
+        assert_eq!(target.to_string(), "192.168.1.50:24801");
     }
 
     #[test]

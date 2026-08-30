@@ -20,6 +20,7 @@ use crate::{
         MAX_RELIABLE_FRAME, MotionDto, PROTOCOL_VERSION, ReliableEvent, decode, decode_input,
         encode, encode_frame, encode_input,
     },
+    target::ServerTarget,
     transport,
 };
 
@@ -35,8 +36,10 @@ pub struct HostConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
-    pub target: SocketAddr,
-    pub cert: PathBuf,
+    pub target: ServerTarget,
+    pub identity_cert: PathBuf,
+    pub identity_key: PathBuf,
+    pub server_cert: PathBuf,
     pub size: Option<ScreenSize>,
     pub retry_for: Duration,
 }
@@ -94,7 +97,7 @@ pub enum AppEvent {
     StatusChanged(RuntimeStatus),
     PeerChanged(Option<SocketAddr>),
     ControlChanged(ControlTarget),
-    ConfigChanged(AppConfig),
+    ConfigChanged(Box<AppConfig>),
     Faulted(AppFault),
 }
 
@@ -151,7 +154,7 @@ impl AppEventBus {
             }
             AppEvent::PeerChanged(peer) => snapshot.peer = *peer,
             AppEvent::ControlChanged(control) => snapshot.control = Some(*control),
-            AppEvent::ConfigChanged(config) => snapshot.config = config.clone(),
+            AppEvent::ConfigChanged(config) => snapshot.config = (**config).clone(),
             AppEvent::Faulted(fault) => snapshot.fault = Some(fault.clone()),
         }
     }
@@ -320,7 +323,7 @@ async fn supervisor(
                 break;
             }
             AppCommand::UpdateConfig(config) => {
-                events.send(AppEvent::ConfigChanged(config)).await;
+                events.send(AppEvent::ConfigChanged(Box::new(config))).await;
                 continue;
             }
         };
@@ -353,7 +356,9 @@ async fn supervisor(
                         break;
                     }
                     Some(AppCommand::UpdateConfig(config)) => {
-                        events.send(AppEvent::ConfigChanged(config)).await;
+                        events
+                            .send(AppEvent::ConfigChanged(Box::new(config)))
+                            .await;
                     }
                     Some(AppCommand::StartHost(_)) | Some(AppCommand::StartClient(_)) => {
                         let fault = AppFault {
@@ -596,24 +601,25 @@ async fn run_client(
         Some(size) => size,
         None => platform::screen_size()?,
     };
-    let bind_ip = if config.target.is_ipv4() {
+    let target = config.target.resolve().await?;
+    let bind_ip = if target.is_ipv4() {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
     } else {
         IpAddr::V6(Ipv6Addr::UNSPECIFIED)
     };
-    let endpoint = transport::client_endpoint(SocketAddr::new(bind_ip, 0), &config.cert)?;
+    let endpoint = transport::client_endpoint(SocketAddr::new(bind_ip, 0), &config.server_cert)?;
     let retry_deadline = tokio::time::Instant::now() + config.retry_for;
     let mut attempt = 0_u32;
     loop {
         attempt = attempt.saturating_add(1);
         diagnostics.emit(DiagnosticEvent::ConnectionAttempt {
             attempt,
-            remote: config.target,
+            remote: target,
         });
         publish_status(&events, RuntimeStatus::Connecting).await;
         let result = run_client_once(
             &endpoint,
-            config.target,
+            target,
             size,
             stop.clone(),
             events.clone(),
@@ -623,7 +629,7 @@ async fn run_client(
         match result {
             Ok(()) => return Ok(()),
             Err(error) if tokio::time::Instant::now() < retry_deadline => {
-                tracing::warn!(%error, remote = %config.target, "client session ended; retrying");
+                tracing::warn!(%error, remote = %target, "client session ended; retrying");
                 events.try_send(AppEvent::PeerChanged(None));
                 publish_status(&events, RuntimeStatus::Retrying).await;
                 let remaining =
@@ -821,7 +827,9 @@ mod tests {
             host: None,
             client: Some(ClientConfig {
                 target: "127.0.0.1:24801".parse().unwrap(),
-                cert: PathBuf::from("cert.der"),
+                identity_cert: PathBuf::from("identity-cert.der"),
+                identity_key: PathBuf::from("identity-key.der"),
+                server_cert: PathBuf::from("server-cert.der"),
                 size: Some(ScreenSize::new(100, 100).unwrap()),
                 retry_for: Duration::from_secs(30),
             }),
@@ -832,7 +840,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             runtime.next_event().await,
-            Some(AppEvent::ConfigChanged(config.clone()))
+            Some(AppEvent::ConfigChanged(Box::new(config.clone())))
         );
         assert_eq!(runtime.snapshot().config, config);
         runtime.shutdown().await.unwrap();

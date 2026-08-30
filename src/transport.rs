@@ -1,21 +1,11 @@
-use std::{
-    fs::{self, OpenOptions},
-    io::Write,
-    net::SocketAddr,
-    path::Path,
-    sync::Arc,
-    time::Duration,
-};
+use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig, TransportConfig, VarInt};
 use rustls::RootCertStore;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-pub const SERVER_NAME: &str = "rflow.local";
+use crate::identity::{IdentityPaths, TLS_SERVER_NAME};
 
 fn transport_config() -> Result<Arc<TransportConfig>> {
     let mut transport = TransportConfig::default();
@@ -56,31 +46,20 @@ pub async fn accept_one(endpoint: &Endpoint) -> Result<Connection> {
 
 pub async fn connect(endpoint: &Endpoint, remote: SocketAddr) -> Result<Connection> {
     endpoint
-        .connect(remote, SERVER_NAME)
+        .connect(remote, TLS_SERVER_NAME)
         .context("start QUIC connection")?
         .await
         .context("connect to rflow receiver")
 }
 
 pub fn generate_identity(cert_path: &Path, key_path: &Path, force: bool) -> Result<()> {
-    if !force && (cert_path.exists() || key_path.exists()) {
-        bail!("certificate or key already exists; pass --force to overwrite");
-    }
-    let identity = rcgen::generate_simple_self_signed(vec![SERVER_NAME.into()])?;
-    fs::write(cert_path, identity.cert.der()).context("write certificate")?;
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut key_file = options.open(key_path).context("create private key")?;
-    key_file
-        .write_all(&identity.signing_key.serialize_der())
-        .context("write private key")?;
-    #[cfg(unix)]
-    key_file
-        .set_permissions(std::fs::Permissions::from_mode(0o600))
-        .context("secure private key permissions")?;
-    Ok(())
+    crate::identity::generate_identity(
+        &IdentityPaths {
+            certificate: cert_path.to_owned(),
+            private_key: key_path.to_owned(),
+        },
+        force,
+    )
 }
 
 #[cfg(test)]
