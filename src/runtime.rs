@@ -107,6 +107,7 @@ pub enum RuntimeStatus {
     Connected,
     Retrying,
     Stopping,
+    ConfigurationRequired,
     Faulted,
 }
 
@@ -196,7 +197,12 @@ impl AppEventBus {
                     snapshot.peer = None;
                     snapshot.control = None;
                     snapshot.fault = None;
-                } else if matches!(status, RuntimeStatus::Stopped | RuntimeStatus::Faulted) {
+                } else if matches!(
+                    status,
+                    RuntimeStatus::Stopped
+                        | RuntimeStatus::ConfigurationRequired
+                        | RuntimeStatus::Faulted
+                ) {
                     snapshot.control = None;
                 }
             }
@@ -389,7 +395,11 @@ impl RuntimeHandle {
         while let Some(event) = self.events.recv().await {
             if matches!(
                 event,
-                AppEvent::StatusChanged(RuntimeStatus::Stopped | RuntimeStatus::Faulted)
+                AppEvent::StatusChanged(
+                    RuntimeStatus::Stopped
+                        | RuntimeStatus::ConfigurationRequired
+                        | RuntimeStatus::Faulted
+                )
             ) {
                 break;
             }
@@ -551,7 +561,15 @@ async fn finish_session(
                 message: format!("{error:#}"),
             });
             let fault = classify_fault(&error);
-            publish_status(events, RuntimeStatus::Faulted).await;
+            let status = if matches!(
+                fault.kind,
+                FaultKind::PermissionDenied | FaultKind::PlatformUnavailable
+            ) {
+                RuntimeStatus::ConfigurationRequired
+            } else {
+                RuntimeStatus::Faulted
+            };
+            publish_status(events, status).await;
             events.send(AppEvent::Faulted(fault)).await;
         }
         Err(error) => {
