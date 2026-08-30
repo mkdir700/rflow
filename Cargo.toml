@@ -15,6 +15,7 @@ rcgen = "0.14"
 rustls = "0.23"
 rustls-pki-types = "1.14"
 serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
 tokio = { version = "1.53", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

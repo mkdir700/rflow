@@ -10,6 +10,7 @@ pub(crate) mod input;
 pub(crate) mod input;
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 compile_error!("rflow currently supports Linux, Windows, and macOS");
+pub mod pairing;
 pub mod platform;
 pub mod protocol;
 pub mod runtime;
