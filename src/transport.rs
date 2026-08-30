@@ -2,11 +2,13 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     net::SocketAddr,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
     sync::Arc,
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use anyhow::{Context, Result, bail};
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig, TransportConfig, VarInt};
@@ -66,16 +68,15 @@ pub fn generate_identity(cert_path: &Path, key_path: &Path, force: bool) -> Resu
     }
     let identity = rcgen::generate_simple_self_signed(vec![SERVER_NAME.into()])?;
     fs::write(cert_path, identity.cert.der()).context("write certificate")?;
-    let mut key_file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(key_path)
-        .context("create private key")?;
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut key_file = options.open(key_path).context("create private key")?;
     key_file
         .write_all(&identity.signing_key.serialize_der())
         .context("write private key")?;
+    #[cfg(unix)]
     key_file
         .set_permissions(std::fs::Permissions::from_mode(0o600))
         .context("secure private key permissions")?;
