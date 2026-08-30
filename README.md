@@ -1,14 +1,14 @@
 # rflow
 
 `rflow` is a low-latency keyboard and mouse sharing MVP. Linux can control another Linux machine
-or a Windows host; Windows input capture is not implemented yet.
+or a Windows/macOS host; Windows and macOS input capture are not implemented yet.
 Pointer motion uses QUIC datagrams and a latest-value slot, so stale movement is discarded instead
 of building a queue. Keys, mouse buttons, and wheel events use a reliable ordered QUIC stream.
 
 ## MVP capabilities
 
 - Capture one or more Linux evdev devices.
-- Inject through Linux `/dev/uinput` or Windows `SendInput`.
+- Inject through Linux `/dev/uinput`, Windows `SendInput`, or macOS CoreGraphics.
 - TLS 1.3 authentication and encryption with an explicitly copied self-signed certificate.
 - Coalesce `REL_X` and `REL_Y` within an evdev batch and discard stale network datagrams.
 - Release held keys/buttons when the sender disconnects or requests shutdown.
@@ -24,9 +24,10 @@ cargo build --release
 ```
 
 The controlling computer currently needs Linux and must be allowed to read the selected
-`/dev/input/event*` devices. A Linux host must be allowed to write `/dev/uinput`; a Windows host
-uses the standard Win32 `SendInput` API. Distribution packages commonly provide an `input` group,
-but group names and recommended udev policy vary.
+`/dev/input/event*` devices. A Linux host must be allowed to write `/dev/uinput`; Windows uses the
+Win32 `SendInput` API, while macOS requires Accessibility permission for the terminal or `rflow`.
+Distribution packages commonly provide an `input` group, but group names and recommended udev
+policy vary.
 
 ## Quick start
 
