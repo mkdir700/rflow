@@ -1,6 +1,6 @@
-use std::fmt;
+use std::{fmt, str::FromStr};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -68,6 +68,20 @@ impl fmt::Display for PairingRequestId {
     }
 }
 
+impl FromStr for PairingRequestId {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let encoded = value
+            .strip_prefix("p-")
+            .context("pairing request ID must start with p-")?;
+        if encoded.len() != 16 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("pairing request ID must contain 16 hexadecimal digits after p-");
+        }
+        Ok(Self(u64::from_str_radix(encoded, 16)?))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PairingProof {
     pub request_id: PairingRequestId,
@@ -76,6 +90,15 @@ pub struct PairingProof {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PairingCode(u32);
+
+impl PairingCode {
+    pub fn from_value(value: u32) -> Result<Self> {
+        if value >= 1_000_000 {
+            bail!("pairing code must be a six-digit value");
+        }
+        Ok(Self(value))
+    }
+}
 
 impl fmt::Display for PairingCode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

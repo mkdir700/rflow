@@ -99,6 +99,19 @@ Forgetting a device removes its trust and endpoint bindings. The next connection
 again. Device names may repeat; use the full device ID printed by `rflow peers` when a name is
 ambiguous.
 
+When the host runs under systemd, launchd, or another non-interactive process, inspect and decide
+the same Runtime's pending request from another terminal:
+
+```bash
+rflow peers pending
+rflow peers accept p-7f31000000000000
+rflow peers reject p-7f31000000000000
+```
+
+These commands use an owner-only local management endpoint; they do not start a second host or
+write the active Runtime's state directly. On an interactive terminal, the usual `[y/N]` prompt
+submits the same Application command.
+
 For unattended pre-provisioning, the client can additionally pin the expected server certificate:
 
 ```bash

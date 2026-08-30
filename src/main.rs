@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
@@ -11,6 +11,11 @@ use clap::{Parser, Subcommand};
 use rflow::{
     core::{ScreenDirection, ScreenSize},
     identity::{device_display_name, ensure_identity, resolve_identity_paths},
+    management::{
+        ManagementRequest, ManagementResponse, ManagementServer, default_endpoint_path,
+        request as management_request,
+    },
+    pairing::PairingRequestId,
     runtime::{
         AppCommand, AppEvent, ClientConfig, HostConfig, RuntimeHandle, RuntimeStatus,
         TracingDiagnostics,
@@ -83,6 +88,12 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum PeersCommand {
+    /// Show the active host's pending pairing request.
+    Pending,
+    /// Accept a pending pairing request.
+    Accept { request_id: PairingRequestId },
+    /// Reject a pending pairing request.
+    Reject { request_id: PairingRequestId },
     /// Remove a trusted device and its endpoint bindings.
     Forget {
         device: String,
@@ -103,15 +114,15 @@ async fn main() -> Result<()> {
             println!("wrote {} and {}", cert.display(), key.display());
             Ok(())
         }
-        Command::Peers { command } => run_peers(command),
+        Command::Peers { command } => run_peers(command).await,
         command => run_session(command).await,
     }
 }
 
-fn run_peers(command: Option<PeersCommand>) -> Result<()> {
-    let mut trust = rflow::trust::TrustStore::platform_default()?;
+async fn run_peers(command: Option<PeersCommand>) -> Result<()> {
     match command {
         None => {
+            let trust = rflow::trust::TrustStore::platform_default()?;
             if trust.peers().is_empty() {
                 println!("No trusted devices.");
             } else {
@@ -121,7 +132,35 @@ fn run_peers(command: Option<PeersCommand>) -> Result<()> {
                 }
             }
         }
+        Some(PeersCommand::Pending) => {
+            match management_request(default_endpoint_path()?, ManagementRequest::Pending).await? {
+                ManagementResponse::Pending(Some(request)) => println!(
+                    "PENDING PAIRING\nRequest: {}\nDevice: {}\nAddress: {}\nFingerprint: {}\nPairing code: {}\nExpires in: {}s\nExpires at (Unix): {}",
+                    request.request_id,
+                    request.device_name,
+                    request.address,
+                    request.fingerprint,
+                    request.code,
+                    request.expires_in_seconds,
+                    request.expires_at_unix_seconds,
+                ),
+                ManagementResponse::Pending(None) => println!("No pending pairing requests."),
+                ManagementResponse::Error(message) => bail!("{message}"),
+                ManagementResponse::DecisionQueued => {
+                    bail!("rflow host returned an invalid management response")
+                }
+            }
+        }
+        Some(PeersCommand::Accept { request_id }) => {
+            submit_pairing_decision(request_id, true).await?;
+            println!("Accepted {request_id}.");
+        }
+        Some(PeersCommand::Reject { request_id }) => {
+            submit_pairing_decision(request_id, false).await?;
+            println!("Rejected {request_id}.");
+        }
         Some(PeersCommand::Forget { device, yes }) => {
+            let mut trust = rflow::trust::TrustStore::platform_default()?;
             let device_id = trust.resolve_peer(&device)?;
             if !yes {
                 print!("Forget trusted device {device} ({device_id})? [y/N] ");
@@ -141,11 +180,39 @@ fn run_peers(command: Option<PeersCommand>) -> Result<()> {
     Ok(())
 }
 
+async fn submit_pairing_decision(request_id: PairingRequestId, accepted: bool) -> Result<()> {
+    let request = if accepted {
+        ManagementRequest::Accept(request_id.0)
+    } else {
+        ManagementRequest::Reject(request_id.0)
+    };
+    match management_request(default_endpoint_path()?, request).await? {
+        ManagementResponse::DecisionQueued => Ok(()),
+        ManagementResponse::Error(message) => bail!("{message}"),
+        ManagementResponse::Pending(_) => {
+            bail!("rflow host returned an invalid management response")
+        }
+    }
+}
+
 async fn run_session(command: Command) -> Result<()> {
     let app_command = command.into_app_command()?;
+    let is_host = matches!(app_command, AppCommand::StartHost(_));
 
     let mut runtime = RuntimeHandle::spawn(Arc::new(TracingDiagnostics))?;
+    let management = if is_host {
+        match ManagementServer::bind(default_endpoint_path()?, runtime.application_handle()).await {
+            Ok(management) => Some(management),
+            Err(error) => {
+                runtime.shutdown().await?;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     runtime.send(app_command).await?;
+    let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::channel(4);
     let mut fault = None;
     loop {
         tokio::select! {
@@ -170,35 +237,70 @@ async fn run_session(command: Command) -> Result<()> {
                         request.fingerprint,
                         request.code,
                     );
-                    print!("Accept this device? [y/N] ");
-                    io::stdout().flush()?;
-                    let mut answer = String::new();
-                    let accepted = io::stdin().read_line(&mut answer).is_ok()
-                        && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
-                    runtime
-                        .send(if accepted {
-                            AppCommand::AcceptPairing(request.request_id)
-                        } else {
-                            AppCommand::RejectPairing(request.request_id)
-                        })
-                        .await?;
+                    if io::stdin().is_terminal() {
+                        print!("Accept this device? [y/N] ");
+                        io::stdout().flush()?;
+                        let prompt_tx = prompt_tx.clone();
+                        let request_id = request.request_id;
+                        std::thread::Builder::new()
+                            .name("rflow-pairing-prompt".to_owned())
+                            .spawn(move || {
+                                let mut answer = String::new();
+                                let accepted = io::stdin().read_line(&mut answer).is_ok()
+                                    && matches!(
+                                        answer.trim().to_ascii_lowercase().as_str(),
+                                        "y" | "yes"
+                                    );
+                                let _ = prompt_tx.blocking_send((request_id, accepted));
+                            })?;
+                    } else {
+                        println!(
+                            "No interactive terminal; decide with `rflow peers accept {}` or `rflow peers reject {}`.",
+                            request.request_id, request.request_id
+                        );
+                    }
                 }
                 Some(AppEvent::PairingCodeReady(request)) => println!(
                     "\nUntrusted server\nDevice: {}\nAddress: {}\nFingerprint: {}\nPairing code: {}\n\nWaiting for confirmation on the server...",
                     request.device_name, request.address, request.fingerprint, request.code,
                 ),
                 Some(AppEvent::PairingCleared(_)) => {}
+                Some(AppEvent::PairingExpired(request_id)) => {
+                    println!("Pairing request {request_id} expired.");
+                }
+                Some(AppEvent::PeerTrusted(peer)) => {
+                    tracing::info!(device_id = %peer.device_id, name = %peer.display_name, "peer trusted");
+                }
                 Some(AppEvent::Faulted(error)) => {
                     fault = Some(error);
                     break;
                 }
                 None => bail!("rflow runtime stopped without a terminal event"),
             },
+            Some((request_id, accepted)) = prompt_rx.recv() => {
+                if runtime
+                    .snapshot()
+                    .pairing
+                    .as_ref()
+                    .is_some_and(|request| request.request_id == request_id)
+                {
+                    runtime
+                        .send(if accepted {
+                            AppCommand::AcceptPairing(request_id)
+                        } else {
+                            AppCommand::RejectPairing(request_id)
+                        })
+                        .await?;
+                }
+            }
             signal = tokio::signal::ctrl_c() => {
                 signal?;
                 runtime.send(AppCommand::Stop).await?;
             }
         }
+    }
+    if let Some(management) = management {
+        management.shutdown().await?;
     }
     runtime.shutdown().await?;
     if let Some(fault) = fault {
@@ -451,6 +553,28 @@ mod tests {
         };
         assert_eq!(device, "macmini");
         assert!(yes);
+    }
+
+    #[test]
+    fn peers_management_commands_parse_request_ids() {
+        let cli = Cli::try_parse_from(["rflow", "peers", "pending"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Peers {
+                command: Some(PeersCommand::Pending)
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["rflow", "peers", "accept", "p-000000000000002a"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Peers {
+                command: Some(PeersCommand::Accept {
+                    request_id: PairingRequestId(42)
+                })
+            }
+        ));
+        assert!(Cli::try_parse_from(["rflow", "peers", "reject", "42"]).is_err());
     }
 
     #[test]

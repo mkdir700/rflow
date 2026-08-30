@@ -33,6 +33,8 @@ use crate::{
     trust::{DeviceId, TrustStore, VerifyPeer},
 };
 
+const PAIRING_REQUEST_LIFETIME: Duration = Duration::from_secs(120);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConfig {
     pub bind: SocketAddr,
@@ -64,7 +66,13 @@ pub struct PairingRequestSummary {
     pub address: SocketAddr,
     pub fingerprint: DeviceId,
     pub code: PairingCode,
-    pub expires_in: Duration,
+    pub expires_at_unix_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSummary {
+    pub device_id: DeviceId,
+    pub display_name: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -127,6 +135,8 @@ pub enum AppEvent {
     PairingRequested(Box<PairingRequestSummary>),
     PairingCodeReady(Box<PairingRequestSummary>),
     PairingCleared(PairingRequestId),
+    PairingExpired(PairingRequestId),
+    PeerTrusted(PeerSummary),
     Faulted(AppFault),
 }
 
@@ -188,7 +198,7 @@ impl AppEventBus {
             AppEvent::ConfigChanged(config) => snapshot.config = (**config).clone(),
             AppEvent::PairingRequested(request) => snapshot.pairing = Some((**request).clone()),
             AppEvent::PairingCodeReady(request) => snapshot.pairing = Some((**request).clone()),
-            AppEvent::PairingCleared(request_id) => {
+            AppEvent::PairingCleared(request_id) | AppEvent::PairingExpired(request_id) => {
                 if snapshot
                     .pairing
                     .as_ref()
@@ -197,6 +207,7 @@ impl AppEventBus {
                     snapshot.pairing = None;
                 }
             }
+            AppEvent::PeerTrusted(_) => {}
             AppEvent::Faulted(fault) => snapshot.fault = Some(fault.clone()),
         }
     }
@@ -250,6 +261,44 @@ pub struct RuntimeHandle {
     completion: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
+/// Cloneable Application capability for presentation and local-management adapters.
+/// It exposes commands and the authoritative projection, but not Runtime internals.
+#[derive(Clone)]
+pub struct ApplicationHandle {
+    commands: mpsc::Sender<AppCommand>,
+    snapshot: Arc<std::sync::RwLock<RuntimeSnapshot>>,
+}
+
+impl ApplicationHandle {
+    pub async fn send(&self, command: AppCommand) -> Result<()> {
+        self.commands
+            .send(command)
+            .await
+            .context("rflow runtime stopped")
+    }
+
+    pub fn snapshot(&self) -> RuntimeSnapshot {
+        self.snapshot
+            .read()
+            .expect("runtime snapshot poisoned")
+            .clone()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn application_test_channel(
+    snapshot: RuntimeSnapshot,
+) -> (ApplicationHandle, mpsc::Receiver<AppCommand>) {
+    let (commands, receiver) = mpsc::channel(4);
+    (
+        ApplicationHandle {
+            commands,
+            snapshot: Arc::new(std::sync::RwLock::new(snapshot)),
+        },
+        receiver,
+    )
+}
+
 impl RuntimeHandle {
     /// Starts an isolated Tokio Runtime thread and a bounded diagnostics worker.
     pub fn spawn(diagnostics: Arc<dyn DiagnosticSink>) -> Result<Self> {
@@ -301,6 +350,13 @@ impl RuntimeHandle {
             .send(command)
             .await
             .context("rflow runtime stopped")
+    }
+
+    pub fn application_handle(&self) -> ApplicationHandle {
+        ApplicationHandle {
+            commands: self.commands.clone(),
+            snapshot: self.snapshot.clone(),
+        }
     }
 
     /// Waits for the next application notification. Consumers must read
@@ -610,37 +666,66 @@ async fn authorize_host_peer(
         address: remote,
         fingerprint: DeviceId::from_certificate(&client_material.certificate),
         code: proof.code,
-        expires_in: Duration::from_secs(120),
+        expires_at_unix_seconds: unix_timestamp()?
+            .saturating_add(PAIRING_REQUEST_LIFETIME.as_secs()),
     };
     publish_status(events, RuntimeStatus::PairingPending).await;
     events
         .send(AppEvent::PairingRequested(Box::new(request)))
         .await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    let accepted = loop {
+    let deadline = tokio::time::Instant::now() + PAIRING_REQUEST_LIFETIME;
+    let outcome = loop {
         tokio::select! {
             decision = decisions.recv() => match decision {
-                Some(decision) if decision.request_id == proof.request_id => break decision.accepted,
+                Some(decision) if decision.request_id == proof.request_id => {
+                    break if decision.accepted {
+                        PairingOutcome::Accepted
+                    } else {
+                        PairingOutcome::Rejected
+                    }
+                },
                 Some(_) => continue,
-                None => break false,
+                None => break PairingOutcome::Rejected,
             },
-            _ = tokio::time::sleep_until(deadline) => break false,
-            _ = wait_for_stop(stop) => break false,
-            _ = connection.closed() => break false,
+            _ = tokio::time::sleep_until(deadline) => break PairingOutcome::Expired,
+            _ = wait_for_stop(stop) => break PairingOutcome::Stopped,
+            _ = connection.closed() => break PairingOutcome::Stopped,
         }
     };
     events
-        .send(AppEvent::PairingCleared(proof.request_id))
+        .send(if outcome == PairingOutcome::Expired {
+            AppEvent::PairingExpired(proof.request_id)
+        } else {
+            AppEvent::PairingCleared(proof.request_id)
+        })
         .await;
-    if !accepted {
+    if outcome != PairingOutcome::Accepted {
         let _ = write_typed_frame(&mut send, &PairingMessage::Rejected).await;
         return Ok(false);
     }
-    trust.remember(client_name, &client_material.certificate, unix_timestamp()?)?;
+    let device_id = trust.remember(
+        client_name.clone(),
+        &client_material.certificate,
+        unix_timestamp()?,
+    )?;
     write_typed_frame(&mut send, &PairingMessage::Accepted).await?;
     expect_pairing_acknowledgement(&mut receive).await?;
+    events
+        .send(AppEvent::PeerTrusted(PeerSummary {
+            device_id,
+            display_name: client_name,
+        }))
+        .await;
     send.finish().context("finish pairing stream")?;
     Ok(true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairingOutcome {
+    Accepted,
+    Rejected,
+    Expired,
+    Stopped,
 }
 
 #[derive(Default)]
@@ -1012,14 +1097,15 @@ async fn authorize_server_peer(
                     address: remote,
                     fingerprint: DeviceId::from_certificate(&server_material.certificate),
                     code: proof.code,
-                    expires_in: Duration::from_secs(120),
+                    expires_at_unix_seconds: unix_timestamp()?
+                        .saturating_add(PAIRING_REQUEST_LIFETIME.as_secs()),
                 },
             )))
             .await;
     }
     let decision: PairingMessage = tokio::select! {
         message = read_typed_frame(&mut receive) => message?,
-        _ = tokio::time::sleep(Duration::from_secs(120)) => bail!("pairing request expired"),
+        _ = tokio::time::sleep(PAIRING_REQUEST_LIFETIME) => bail!("pairing request expired"),
         _ = wait_for_stop(stop) => return Ok(false),
     };
     if matches!(verification, VerifyPeer::Unknown(_)) {
@@ -1035,9 +1121,18 @@ async fn authorize_server_peer(
         }
     }
     if matches!(verification, VerifyPeer::Unknown(_)) {
-        let device_id =
-            trust.remember(server_name, &server_material.certificate, unix_timestamp()?)?;
+        let device_id = trust.remember(
+            server_name.clone(),
+            &server_material.certificate,
+            unix_timestamp()?,
+        )?;
         trust.bind_endpoint(endpoint, device_id)?;
+        events
+            .send(AppEvent::PeerTrusted(PeerSummary {
+                device_id,
+                display_name: server_name,
+            }))
+            .await;
     }
     write_typed_frame(&mut send, &PairingMessage::Acknowledged).await?;
     send.finish().context("finish pairing acknowledgement")?;

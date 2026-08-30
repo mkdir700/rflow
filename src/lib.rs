@@ -1,6 +1,7 @@
 pub mod core;
 pub mod identity;
 pub(crate) mod input;
+pub mod management;
 pub mod pairing;
 pub mod platform;
 pub mod protocol;
