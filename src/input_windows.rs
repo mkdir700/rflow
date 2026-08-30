@@ -9,7 +9,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput,
 };
 
-use crate::protocol::{Motion, ReliableEvent};
+use crate::{
+    protocol::{Motion, ReliableEvent},
+    router::ScreenSize,
+};
 
 pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
@@ -19,7 +22,15 @@ const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
 
 pub fn validate_capture(_paths: &[PathBuf]) -> Result<()> {
-    bail!("Windows input capture is not implemented; use Windows as `rflow host`")
+    anyhow::bail!("Windows input capture is not implemented; use Windows as `rflow client`")
+}
+
+pub fn screen_size() -> Result<ScreenSize> {
+    anyhow::bail!("automatic screen size is unavailable on Windows; pass --size WIDTHxHEIGHT")
+}
+
+pub fn cursor_position() -> Option<(i32, i32)> {
+    None
 }
 
 pub fn spawn_capture(
@@ -41,6 +52,11 @@ impl Injector {
 
     pub fn emit_motion(&mut self, dx: i32, dy: i32) -> Result<()> {
         send_mouse(dx, dy, 0, MOUSEEVENTF_MOVE)
+    }
+
+    pub fn set_cursor_position(&mut self, x: i32, y: i32) -> Result<()> {
+        self.emit_motion(-1_000_000, -1_000_000)?;
+        self.emit_motion(x.max(0), y.max(0))
     }
 
     pub fn emit_raw(&mut self, event_type: u16, code: u16, value: i32) -> Result<()> {

@@ -13,13 +13,14 @@ use rflow::{
     protocol::{
         MAX_RELIABLE_FRAME, Motion, PROTOCOL_VERSION, ReliableEvent, decode, encode, encode_frame,
     },
+    router::{ActiveScreen, CursorRouter, Route, ScreenSize},
     state::{MotionFilter, PressedState},
     transport,
 };
 use tokio::sync::{mpsc, watch};
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Low-latency Linux keyboard and mouse sharing")]
+#[command(version, about = "Low-latency virtual KVM over QUIC")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -27,7 +28,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Generate this host's certificate and private key.
+    /// Generate the host certificate and private key.
     Keygen {
         #[arg(long, default_value = "rflow-cert.der")]
         cert: PathBuf,
@@ -36,7 +37,7 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Make this computer available for remote control.
+    /// Own the physical keyboard/mouse and route them across screens.
     Host {
         #[arg(long, default_value = "[::]:24801")]
         bind: SocketAddr,
@@ -44,19 +45,25 @@ enum Command {
         cert: PathBuf,
         #[arg(long, default_value = "rflow-key.der")]
         key: PathBuf,
+        /// Size of this screen in physical pixels.
+        #[arg(long)]
+        size: ScreenSize,
+        /// Physical Linux evdev path. Repeat for keyboard and mouse.
+        #[arg(long)]
+        device: Vec<PathBuf>,
+        /// Place the single client screen to the right of this host.
+        #[arg(long)]
+        right: bool,
     },
-    /// Control another computer with this computer's input devices.
-    Connect {
+    /// Join a host as a remotely controlled screen.
+    Client {
         /// Host address, for example 192.168.1.50:24801.
         target: SocketAddr,
         #[arg(long, default_value = "rflow-cert.der")]
         cert: PathBuf,
-        /// Linux evdev path. Repeat for keyboard and mouse; not used on macOS.
+        /// Override automatic screen-size detection.
         #[arg(long)]
-        device: Vec<PathBuf>,
-        /// Exclusively grab devices. Use only after verifying the emergency stop path.
-        #[arg(long)]
-        grab: bool,
+        size: Option<ScreenSize>,
     },
 }
 
@@ -71,18 +78,162 @@ async fn main() -> Result<()> {
             println!("wrote {} and {}", cert.display(), key.display());
             Ok(())
         }
-        Command::Host { bind, cert, key } => receive(bind, cert, key).await,
-        Command::Connect {
-            target,
+        Command::Host {
+            bind,
             cert,
+            key,
+            size,
             device,
-            grab,
-        } => send(target, cert, device, grab).await,
+            right,
+        } => host(bind, cert, key, size, device, right).await,
+        Command::Client { target, cert, size } => client(target, cert, size).await,
     }
 }
 
-async fn send(to: SocketAddr, cert: PathBuf, devices: Vec<PathBuf>, grab: bool) -> Result<()> {
+async fn host(
+    bind: SocketAddr,
+    cert: PathBuf,
+    key: PathBuf,
+    local_size: ScreenSize,
+    devices: Vec<PathBuf>,
+    right: bool,
+) -> Result<()> {
+    if !right {
+        bail!("the MVP supports one client on the right; pass --right");
+    }
     rflow::input::validate_capture(&devices)?;
+    let endpoint = transport::server_endpoint(bind, &cert, &key)?;
+    tracing::info!(local = %endpoint.local_addr()?, "host listening");
+    let connection = transport::accept_one(&endpoint).await?;
+    tracing::info!(remote = %connection.remote_address(), "client connected");
+    host_connection(connection, local_size, devices).await
+}
+
+async fn host_connection(
+    connection: Connection,
+    local_size: ScreenSize,
+    devices: Vec<PathBuf>,
+) -> Result<()> {
+    let mut metadata = connection
+        .accept_uni()
+        .await
+        .context("accept client metadata stream")?;
+    let remote_size = match read_reliable(&mut metadata).await? {
+        ReliableEvent::ClientHello {
+            version: PROTOCOL_VERSION,
+            width,
+            height,
+        } => ScreenSize::new(width, height).map_err(anyhow::Error::msg)?,
+        ReliableEvent::ClientHello { version, .. } => {
+            bail!("unsupported client protocol version {version}")
+        }
+        _ => bail!("first client message must be ClientHello"),
+    };
+
+    let mut remote_stream = connection
+        .open_uni()
+        .await
+        .context("open host input stream")?;
+    write_reliable(
+        &mut remote_stream,
+        &ReliableEvent::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )
+    .await?;
+
+    let mut router = CursorRouter::right(local_size, remote_size);
+    let mut local_injector = Injector::new()?;
+    if let Some((x, y)) = rflow::input::cursor_position() {
+        router.set_local_position(x, y);
+    }
+
+    let (reliable_tx, mut reliable_rx) = mpsc::channel(256);
+    let (motion_tx, mut motion_rx) = watch::channel(None);
+    let _capture_threads = spawn_capture(devices, true, reliable_tx, motion_tx);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+    let mut heartbeat_sequence = 0_u64;
+
+    loop {
+        tokio::select! {
+            event = reliable_rx.recv() => {
+                let Some(event) = event else { bail!("all host input capture threads stopped") };
+                route_reliable(router.active(), &mut local_injector, &mut remote_stream, event).await?;
+            }
+            changed = motion_rx.changed() => {
+                changed.context("all host pointer capture threads stopped")?;
+                if let Some(motion) = *motion_rx.borrow_and_update() {
+                    route_motion(&connection, &mut remote_stream, &mut local_injector, &mut router, motion).await?;
+                }
+            }
+            _ = heartbeat.tick() => {
+                heartbeat_sequence = heartbeat_sequence.wrapping_add(1);
+                write_reliable(&mut remote_stream, &ReliableEvent::Heartbeat { sequence: heartbeat_sequence }).await?;
+            }
+            closed = connection.closed() => bail!("client connection closed: {closed}"),
+            _ = tokio::signal::ctrl_c() => {
+                let _ = write_reliable(&mut remote_stream, &ReliableEvent::ReleaseAll).await;
+                connection.close(0_u32.into(), b"host stopped");
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn route_reliable(
+    active: ActiveScreen,
+    local: &mut Injector,
+    remote: &mut SendStream,
+    event: ReliableEvent,
+) -> Result<()> {
+    match (active, event) {
+        (
+            ActiveScreen::Local,
+            ReliableEvent::Input {
+                event_type,
+                code,
+                value,
+                ..
+            },
+        ) => local.emit_raw(event_type, code, value),
+        (ActiveScreen::Remote, event @ ReliableEvent::Input { .. }) => {
+            write_reliable(remote, &event).await
+        }
+        _ => Ok(()),
+    }
+}
+
+async fn route_motion(
+    connection: &Connection,
+    remote_stream: &mut SendStream,
+    local: &mut Injector,
+    router: &mut CursorRouter,
+    motion: Motion,
+) -> Result<()> {
+    match router.route_motion(motion.dx, motion.dy) {
+        Route::Local { dx, dy } => local.emit_motion(dx, dy),
+        Route::Remote { dx, dy } => {
+            let routed = Motion { dx, dy, ..motion };
+            connection
+                .send_datagram(Bytes::from(encode(&routed)?))
+                .context("send remote pointer motion")
+        }
+        Route::EnterRemote { x, y } => {
+            tracing::info!(x, y, "cursor entered client screen");
+            write_reliable(remote_stream, &ReliableEvent::EnterScreen { x, y }).await
+        }
+        Route::EnterLocal { x, y } => {
+            tracing::info!(x, y, "cursor returned to host screen");
+            local.set_cursor_position(x, y)
+        }
+    }
+}
+
+async fn client(to: SocketAddr, cert: PathBuf, requested_size: Option<ScreenSize>) -> Result<()> {
+    let size = match requested_size {
+        Some(size) => size,
+        None => rflow::input::screen_size()?,
+    };
     let bind_ip = if to.is_ipv4() {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
     } else {
@@ -90,87 +241,39 @@ async fn send(to: SocketAddr, cert: PathBuf, devices: Vec<PathBuf>, grab: bool) 
     };
     let endpoint = transport::client_endpoint(SocketAddr::new(bind_ip, 0), &cert)?;
     let connection = transport::connect(&endpoint, to).await?;
-    tracing::info!(remote = %to, "connected to receiver");
-    let mut stream = connection
+    tracing::info!(remote = %to, width = size.width, height = size.height, "connected to host");
+
+    let mut metadata = connection
         .open_uni()
         .await
-        .context("open reliable input stream")?;
+        .context("open client metadata stream")?;
     write_reliable(
-        &mut stream,
-        &ReliableEvent::Hello {
+        &mut metadata,
+        &ReliableEvent::ClientHello {
             version: PROTOCOL_VERSION,
+            width: size.width,
+            height: size.height,
         },
     )
     .await?;
+    metadata.finish()?;
 
-    let (reliable_tx, mut reliable_rx) = mpsc::channel(256);
-    let (motion_tx, mut motion_rx) = watch::channel(None);
-    let _capture_threads = spawn_capture(devices, grab, reliable_tx, motion_tx);
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
-    let mut heartbeat_sequence = 0_u64;
-
-    loop {
-        tokio::select! {
-            event = reliable_rx.recv() => {
-                let Some(event) = event else { bail!("all input capture threads stopped") };
-                write_reliable(&mut stream, &event).await?;
-            }
-            changed = motion_rx.changed() => {
-                changed.context("all pointer capture threads stopped")?;
-                let motion = *motion_rx.borrow_and_update();
-                if let Some(motion) = motion {
-                    connection.send_datagram(Bytes::from(encode(&motion)?))
-                        .context("send pointer datagram")?;
-                }
-            }
-            _ = heartbeat.tick() => {
-                heartbeat_sequence = heartbeat_sequence.wrapping_add(1);
-                write_reliable(&mut stream, &ReliableEvent::Heartbeat { sequence: heartbeat_sequence }).await?;
-            }
-            _ = tokio::signal::ctrl_c() => {
-                let _ = write_reliable(&mut stream, &ReliableEvent::ReleaseAll).await;
-                stream.finish()?;
-                connection.close(0_u32.into(), b"sender stopped");
-                return Ok(());
-            }
-        }
-    }
-}
-
-async fn receive(bind: SocketAddr, cert: PathBuf, key: PathBuf) -> Result<()> {
-    let endpoint = transport::server_endpoint(bind, &cert, &key)?;
-    tracing::info!(local = %endpoint.local_addr()?, "receiver listening");
-    loop {
-        let connection = transport::accept_one(&endpoint).await?;
-        tracing::info!(remote = %connection.remote_address(), "sender connected");
-        tokio::select! {
-            result = receive_connection(connection.clone()) => {
-                if let Err(error) = result {
-                    tracing::warn!(%error, "sender disconnected");
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                connection.close(0_u32.into(), b"receiver stopped");
-                return Ok(());
-            }
-        }
-    }
-}
-
-async fn receive_connection(connection: Connection) -> Result<()> {
-    let mut injector = Injector::new()?;
     let mut stream = connection
         .accept_uni()
         .await
-        .context("accept reliable input stream")?;
+        .context("accept host input stream")?;
     match read_reliable(&mut stream).await? {
         ReliableEvent::Hello {
             version: PROTOCOL_VERSION,
         } => {}
-        ReliableEvent::Hello { version } => bail!("unsupported protocol version {version}"),
-        _ => bail!("first reliable message must be Hello"),
+        ReliableEvent::Hello { version } => bail!("unsupported host protocol version {version}"),
+        _ => bail!("first host message must be Hello"),
     }
+    client_connection(connection, stream).await
+}
 
+async fn client_connection(connection: Connection, mut stream: RecvStream) -> Result<()> {
+    let mut injector = Injector::new()?;
     let mut motion_filter = MotionFilter::default();
     let mut pressed = PressedState::default();
     let result: Result<()> = async {
@@ -185,13 +288,16 @@ async fn receive_connection(connection: Connection) -> Result<()> {
                 }
                 event = read_reliable(&mut stream) => {
                     match event? {
+                        ReliableEvent::EnterScreen { x, y } => injector.set_cursor_position(x, y)?,
                         ReliableEvent::Input { event_type, code, value, .. } => {
                             pressed.observe(event_type, code, value);
                             injector.emit_raw(event_type, code, value)?;
                         }
                         ReliableEvent::ReleaseAll => release_all(&mut injector, &mut pressed)?,
                         ReliableEvent::Heartbeat { .. } => {}
-                        ReliableEvent::Hello { .. } => bail!("unexpected duplicate Hello"),
+                        ReliableEvent::Hello { .. } | ReliableEvent::ClientHello { .. } => {
+                            bail!("unexpected handshake message")
+                        }
                     }
                 }
             }
@@ -239,40 +345,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_command_parses_with_defaults() {
-        let cli = Cli::try_parse_from(["rflow", "host"]).unwrap();
+    fn host_parses_explicit_right_layout() {
+        let cli = Cli::try_parse_from([
+            "rflow",
+            "host",
+            "--size",
+            "1920x1080",
+            "--right",
+            "--device",
+            "/dev/input/event1",
+        ])
+        .unwrap();
         match cli.command {
-            Command::Host { bind, cert, key } => {
-                assert_eq!(bind, "[::]:24801".parse().unwrap());
-                assert_eq!(cert, PathBuf::from("rflow-cert.der"));
-                assert_eq!(key, PathBuf::from("rflow-key.der"));
+            Command::Host {
+                size,
+                right,
+                device,
+                ..
+            } => {
+                assert_eq!(
+                    size,
+                    ScreenSize {
+                        width: 1920,
+                        height: 1080
+                    }
+                );
+                assert!(right);
+                assert_eq!(device, vec![PathBuf::from("/dev/input/event1")]);
             }
             _ => panic!("expected host command"),
         }
     }
 
     #[test]
-    fn connect_uses_positional_target() {
-        let cli = Cli::try_parse_from([
-            "rflow",
-            "connect",
-            "192.168.1.50:24801",
-            "--device",
-            "/dev/input/event1",
-        ])
-        .unwrap();
+    fn client_uses_positional_host() {
+        let cli = Cli::try_parse_from(["rflow", "client", "192.168.1.50:24801"]).unwrap();
         match cli.command {
-            Command::Connect { target, device, .. } => {
+            Command::Client { target, size, .. } => {
                 assert_eq!(target, "192.168.1.50:24801".parse().unwrap());
-                assert_eq!(device, vec![PathBuf::from("/dev/input/event1")]);
+                assert_eq!(size, None);
             }
-            _ => panic!("expected connect command"),
+            _ => panic!("expected client command"),
         }
     }
 
     #[test]
-    fn legacy_commands_are_not_exposed() {
-        assert!(Cli::try_parse_from(["rflow", "send"]).is_err());
-        assert!(Cli::try_parse_from(["rflow", "receive"]).is_err());
+    fn retired_connect_command_is_not_exposed() {
+        assert!(Cli::try_parse_from(["rflow", "connect", "192.168.1.50:24801"]).is_err());
     }
 }

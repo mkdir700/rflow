@@ -1,5 +1,6 @@
 use std::{
     path::PathBuf,
+    process::Command,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -14,6 +15,7 @@ use evdev::{
 use tokio::sync::{mpsc, watch};
 
 use crate::protocol::{Motion, ReliableEvent};
+use crate::router::ScreenSize;
 
 pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
@@ -25,6 +27,20 @@ pub fn validate_capture(paths: &[PathBuf]) -> Result<()> {
         anyhow::bail!("Linux connect requires at least one --device path");
     }
     Ok(())
+}
+
+pub fn screen_size() -> Result<ScreenSize> {
+    anyhow::bail!("automatic screen size is unavailable on Linux; pass --size WIDTHxHEIGHT")
+}
+
+pub fn cursor_position() -> Option<(i32, i32)> {
+    let output = Command::new("hyprctl").arg("cursorpos").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let (x, y) = text.trim().split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
 }
 
 pub fn spawn_capture(
@@ -138,6 +154,18 @@ impl Injector {
             self.device.emit(&events).context("inject pointer motion")?;
         }
         Ok(())
+    }
+
+    pub fn set_cursor_position(&mut self, x: i32, y: i32) -> Result<()> {
+        if Command::new("hyprctl")
+            .args(["dispatch", "movecursor", &x.to_string(), &y.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return Ok(());
+        }
+        self.emit_motion(-1_000_000, -1_000_000)?;
+        self.emit_motion(x.max(0), y.max(0))
     }
 
     pub fn emit_raw(&mut self, event_type: u16, code: u16, value: i32) -> Result<()> {

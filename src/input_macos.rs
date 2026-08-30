@@ -13,6 +13,7 @@ use anyhow::{Result, bail};
 use tokio::sync::{mpsc, watch};
 
 use crate::protocol::{Motion, ReliableEvent};
+use crate::router::ScreenSize;
 
 pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
@@ -70,6 +71,9 @@ unsafe extern "C" {
     ) -> CFMachPortRef;
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+    fn CGMainDisplayID() -> u32;
+    fn CGDisplayPixelsWide(display: u32) -> usize;
+    fn CGDisplayPixelsHigh(display: u32) -> usize;
     fn CFRelease(value: *const c_void);
 }
 
@@ -111,6 +115,23 @@ struct CaptureContext {
 
 pub fn validate_capture(_paths: &[PathBuf]) -> Result<()> {
     Ok(())
+}
+
+pub fn screen_size() -> Result<ScreenSize> {
+    let display = unsafe { CGMainDisplayID() };
+    let width = unsafe { CGDisplayPixelsWide(display) };
+    let height = unsafe { CGDisplayPixelsHigh(display) };
+    ScreenSize::new(width as i32, height as i32).map_err(anyhow::Error::msg)
+}
+
+pub fn cursor_position() -> Option<(i32, i32)> {
+    let event = unsafe { CGEventCreate(std::ptr::null_mut()) };
+    if event.is_null() {
+        return None;
+    }
+    let position = unsafe { CGEventGetLocation(event) };
+    unsafe { CFRelease(event) };
+    Some((position.x as i32, position.y as i32))
 }
 
 pub fn spawn_capture(
@@ -331,6 +352,17 @@ impl Injector {
             CGPoint {
                 x: position.x + dx as f64,
                 y: position.y + dy as f64,
+            },
+            0,
+        )
+    }
+
+    pub fn set_cursor_position(&mut self, x: i32, y: i32) -> Result<()> {
+        self.post_mouse(
+            EVENT_MOUSE_MOVED,
+            CGPoint {
+                x: x.max(0) as f64,
+                y: y.max(0) as f64,
             },
             0,
         )

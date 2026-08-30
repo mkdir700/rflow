@@ -1,7 +1,7 @@
 # rflow
 
-`rflow` is a low-latency keyboard and mouse sharing MVP. Linux and macOS can act as the controlling
-computer; Linux, Windows, and macOS can act as a host. Windows input capture is not implemented.
+`rflow` is a low-latency virtual KVM MVP. The host owns the physical keyboard/mouse and screen
+layout; a client is a remote screen that receives input only after the cursor crosses onto it.
 Pointer motion uses QUIC datagrams and a latest-value slot, so stale movement is discarded instead
 of building a queue. Keys, mouse buttons, and wheel events use a reliable ordered QUIC stream.
 
@@ -9,13 +9,15 @@ of building a queue. Keys, mouse buttons, and wheel events use a reliable ordere
 
 - Capture one or more Linux evdev devices.
 - Inject through Linux `/dev/uinput`, Windows `SendInput`, or macOS CoreGraphics.
+- Place one client to the right of the host and switch ownership at the shared screen edge.
+- Map the entry height between screens with different resolutions.
 - TLS 1.3 authentication and encryption with an explicitly copied self-signed certificate.
 - Coalesce `REL_X` and `REL_Y` within an evdev batch and discard stale network datagrams.
 - Release held keys/buttons when the sender disconnects or requests shutdown.
 - IPv4 and IPv6 support, heartbeat, protocol version check, and structured logs.
 
-Not included yet: automatic discovery, GUI configuration, clipboard, screen-edge switching,
-multi-receiver sessions, or support for Windows and macOS.
+Not included yet: automatic discovery, GUI configuration, clipboard, arbitrary screen graphs, or
+multiple simultaneous clients. The current layout is one client to the host's right.
 
 ## Build
 
@@ -23,57 +25,49 @@ multi-receiver sessions, or support for Windows and macOS.
 cargo build --release
 ```
 
-A Linux controlling computer must be allowed to read the selected `/dev/input/event*` devices. A
-Linux host must be allowed to write `/dev/uinput`. Windows uses the Win32 `SendInput` API. macOS
-capture and injection require Accessibility and Input Monitoring permission for the terminal or
-`rflow`. Distribution packages commonly provide an `input` group, but group names and recommended
-udev policy vary.
+A Linux host must be allowed to read its selected `/dev/input/event*` devices and write
+`/dev/uinput`. Windows uses the Win32 `SendInput` API. macOS capture and injection require
+Accessibility and Input Monitoring permission for the terminal or `rflow`. Distribution packages
+commonly provide an `input` group, but group names and recommended udev policy vary.
 
 ## Quick start
 
-On the computer you want to control, generate its identity once:
+On the host—the computer with the physical keyboard and mouse—generate its identity once:
 
 ```bash
 rflow keygen
 ```
 
-Copy `rflow-cert.der` to the controlling computer over a trusted channel. Never copy
-`rflow-key.der` away from the host. Start the host:
-
-```bash
-RUST_LOG=rflow=info rflow host \
-  --bind 0.0.0.0:24801 \
-  --cert rflow-cert.der \
-  --key rflow-key.der
-```
-
-Find the keyboard and mouse event nodes on the controlling computer:
+Copy `rflow-cert.der` to the client over a trusted channel. Never copy `rflow-key.der` away from
+the host. Find stable keyboard and mouse paths:
 
 ```bash
 ls -l /dev/input/by-id/
 ```
 
-Prefer stable `/dev/input/by-id/...-event-kbd` and `...-event-mouse` paths. Then connect:
+Start the host with its physical screen size and the single client on its right:
 
 ```bash
-RUST_LOG=rflow=info rflow connect 192.168.1.50:24801 \
+RUST_LOG=rflow=info rflow host \
+  --bind 0.0.0.0:24801 \
+  --size 2560x1440 \
+  --right \
   --cert rflow-cert.der \
+  --key rflow-key.der \
   --device /dev/input/by-id/your-keyboard-event-kbd \
   --device /dev/input/by-id/your-mouse-event-mouse
 ```
 
-On macOS, no device paths are needed:
+On the client screen, connect to the host:
 
 ```bash
-RUST_LOG=rflow=info rflow connect 192.168.1.50:24801 \
+RUST_LOG=rflow=info rflow client 192.168.1.50:24801 \
   --cert rflow-cert.der
 ```
 
-Without `--grab`, events affect both machines, which is the safest first test. Once SSH or another
-emergency recovery path is available, add `--grab` to make rflow exclusively consume those
-devices. Press Ctrl-C to stop when running without `--grab`. With grabbed keyboards, Ctrl-C is
-sent to the host, so stop `rflow connect` through SSH or another independent input device. Do not
-test `--grab` without that recovery path.
+The host grabs the selected physical devices and reinjects them locally while its own screen is
+active. Keep SSH or another independent input device available during MVP testing. When the cursor
+is on the client, Ctrl-C is routed to the client rather than the host terminal.
 
 ## Latency design
 
@@ -92,6 +86,6 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## Security notes
 
-The copied certificate pins the receiver identity. QUIC encrypts input in transit. The MVP does
-not authenticate the sender to the receiver, so expose UDP port 24801 only to a trusted LAN or
-restrict it with a host firewall. Mutual authentication/pairing is planned beyond the MVP.
+The copied certificate pins the host identity. QUIC encrypts input in transit. The MVP does not
+authenticate the client to the host, so expose UDP port 24801 only to a trusted LAN or restrict it
+with a host firewall. Mutual authentication/pairing is planned beyond the MVP.

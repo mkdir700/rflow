@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_RELIABLE_FRAME: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,6 +16,15 @@ pub struct Motion {
 pub enum ReliableEvent {
     Hello {
         version: u16,
+    },
+    ClientHello {
+        version: u16,
+        width: i32,
+        height: i32,
+    },
+    EnterScreen {
+        x: i32,
+        y: i32,
     },
     Input {
         sequence: u64,

@@ -9,5 +9,6 @@ pub mod input;
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 compile_error!("rflow currently supports Linux, Windows, and macOS");
 pub mod protocol;
+pub mod router;
 pub mod state;
 pub mod transport;
