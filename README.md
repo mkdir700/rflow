@@ -87,6 +87,18 @@ On the first connection, both terminals display the same six-digit pairing code.
 then enter `y` on the host to trust the client. rflow does not grab the host input devices until this
 confirmation succeeds. Both devices remember the trust relationship for later connections.
 
+List the remembered devices or explicitly remove one with:
+
+```bash
+rflow peers
+rflow peers forget macmini
+rflow peers forget macmini --yes  # non-interactive scripts
+```
+
+Forgetting a device removes its trust and endpoint bindings. The next connection must be paired
+again. Device names may repeat; use the full device ID printed by `rflow peers` when a name is
+ambiguous.
+
 For unattended pre-provisioning, the client can additionally pin the expected server certificate:
 
 ```bash

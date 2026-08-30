@@ -74,6 +74,22 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         retry_for: u64,
     },
+    /// List and manage trusted devices.
+    Peers {
+        #[command(subcommand)]
+        command: Option<PeersCommand>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PeersCommand {
+    /// Remove a trusted device and its endpoint bindings.
+    Forget {
+        device: String,
+        /// Skip the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -87,8 +103,42 @@ async fn main() -> Result<()> {
             println!("wrote {} and {}", cert.display(), key.display());
             Ok(())
         }
+        Command::Peers { command } => run_peers(command),
         command => run_session(command).await,
     }
+}
+
+fn run_peers(command: Option<PeersCommand>) -> Result<()> {
+    let mut trust = rflow::trust::TrustStore::platform_default()?;
+    match command {
+        None => {
+            if trust.peers().is_empty() {
+                println!("No trusted devices.");
+            } else {
+                println!("TRUSTED DEVICES");
+                for peer in trust.peers() {
+                    println!("{}  {}", peer.device_id, peer.display_name);
+                }
+            }
+        }
+        Some(PeersCommand::Forget { device, yes }) => {
+            let device_id = trust.resolve_peer(&device)?;
+            if !yes {
+                print!("Forget trusted device {device} ({device_id})? [y/N] ");
+                io::stdout().flush()?;
+                let mut answer = String::new();
+                let confirmed = io::stdin().read_line(&mut answer).is_ok()
+                    && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+                if !confirmed {
+                    println!("Cancelled.");
+                    return Ok(());
+                }
+            }
+            trust.forget(device_id)?;
+            println!("Forgot {device}.");
+        }
+    }
+    Ok(())
 }
 
 async fn run_session(command: Command) -> Result<()> {
@@ -203,6 +253,9 @@ impl Command {
                 })
             }
             Command::Keygen { .. } => unreachable!("keygen is handled before session startup"),
+            Command::Peers { .. } => {
+                unreachable!("peer management is handled before session startup")
+            }
         })
     }
 }
@@ -385,6 +438,19 @@ mod tests {
             Command::Client { retry_for, .. } => assert_eq!(retry_for, 120),
             _ => panic!("expected client command"),
         }
+    }
+
+    #[test]
+    fn peers_forget_requires_an_explicit_device_and_supports_yes() {
+        let cli = Cli::try_parse_from(["rflow", "peers", "forget", "macmini", "--yes"]).unwrap();
+        let Command::Peers {
+            command: Some(PeersCommand::Forget { device, yes }),
+        } = cli.command
+        else {
+            panic!("expected peers forget command")
+        };
+        assert_eq!(device, "macmini");
+        assert!(yes);
     }
 
     #[test]

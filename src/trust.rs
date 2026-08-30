@@ -2,6 +2,7 @@ use std::{
     fmt, fs,
     io::Write,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 #[cfg(unix)]
@@ -36,6 +37,26 @@ impl fmt::Display for DeviceId {
             write!(formatter, "{byte:02X}")?;
         }
         Ok(())
+    }
+}
+
+impl FromStr for DeviceId {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let compact: String = value
+            .chars()
+            .filter(|character| *character != ':')
+            .collect();
+        if compact.len() != 64 || !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("device ID must contain 64 hexadecimal digits");
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&compact[index * 2..index * 2 + 2], 16)
+                .context("parse device ID")?;
+        }
+        Ok(Self(bytes))
     }
 }
 
@@ -116,6 +137,32 @@ impl TrustStore {
 
     pub fn peers(&self) -> &[TrustedPeer] {
         &self.database.peers
+    }
+
+    pub fn resolve_peer(&self, query: &str) -> Result<DeviceId> {
+        if let Ok(device_id) = query.parse::<DeviceId>() {
+            if self
+                .database
+                .peers
+                .iter()
+                .any(|peer| peer.device_id == device_id)
+            {
+                return Ok(device_id);
+            }
+            bail!("trusted device {device_id} was not found");
+        }
+        let mut matches = self
+            .database
+            .peers
+            .iter()
+            .filter(|peer| peer.display_name == query);
+        let first = matches
+            .next()
+            .with_context(|| format!("trusted device {query} was not found"))?;
+        if matches.next().is_some() {
+            bail!("multiple trusted devices are named {query}; use the device ID");
+        }
+        Ok(first.device_id)
     }
 
     pub fn remember(

@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
@@ -519,6 +520,7 @@ async fn run_host(
     };
     let endpoint = transport::pairing_server_endpoint(config.bind, &identity)?;
     let mut trust = TrustStore::load(&config.trust_store)?;
+    let mut pairing_rate_limiter = PairingRateLimiter::default();
     tracing::info!(local = %endpoint.local_addr()?, "host listening");
     publish_status(&events, RuntimeStatus::Listening).await;
     loop {
@@ -531,6 +533,7 @@ async fn run_host(
             &connection,
             &config,
             &mut trust,
+            &mut pairing_rate_limiter,
             &mut pairing_decisions,
             &mut stop,
             &events,
@@ -563,6 +566,7 @@ async fn authorize_host_peer(
     connection: &Connection,
     config: &HostConfig,
     trust: &mut TrustStore,
+    rate_limiter: &mut PairingRateLimiter,
     decisions: &mut mpsc::Receiver<PairingDecision>,
     stop: &mut watch::Receiver<bool>,
     events: &AppEventBus,
@@ -593,6 +597,11 @@ async fn authorize_host_peer(
         expect_pairing_acknowledgement(&mut receive).await?;
         send.finish().context("finish pairing stream")?;
         return Ok(true);
+    }
+
+    if !rate_limiter.allow(remote.ip(), tokio::time::Instant::now()) {
+        let _ = write_typed_frame(&mut send, &PairingMessage::Rejected).await;
+        return Ok(false);
     }
 
     let request = PairingRequestSummary {
@@ -632,6 +641,34 @@ async fn authorize_host_peer(
     expect_pairing_acknowledgement(&mut receive).await?;
     send.finish().context("finish pairing stream")?;
     Ok(true)
+}
+
+#[derive(Default)]
+struct PairingRateLimiter {
+    attempts: VecDeque<(tokio::time::Instant, IpAddr)>,
+}
+
+impl PairingRateLimiter {
+    fn allow(&mut self, source: IpAddr, now: tokio::time::Instant) -> bool {
+        let window = Duration::from_secs(60);
+        while self
+            .attempts
+            .front()
+            .is_some_and(|(attempt, _)| now.duration_since(*attempt) >= window)
+        {
+            self.attempts.pop_front();
+        }
+        let source_attempts = self
+            .attempts
+            .iter()
+            .filter(|(_, address)| *address == source)
+            .count();
+        if self.attempts.len() >= 20 || source_attempts >= 5 {
+            return false;
+        }
+        self.attempts.push_back((now, source));
+        true
+    }
 }
 
 async fn expect_pairing_acknowledgement(receive: &mut RecvStream) -> Result<()> {
@@ -985,9 +1022,11 @@ async fn authorize_server_peer(
         _ = tokio::time::sleep(Duration::from_secs(120)) => bail!("pairing request expired"),
         _ = wait_for_stop(stop) => return Ok(false),
     };
-    events
-        .send(AppEvent::PairingCleared(proof.request_id))
-        .await;
+    if matches!(verification, VerifyPeer::Unknown(_)) {
+        events
+            .send(AppEvent::PairingCleared(proof.request_id))
+            .await;
+    }
     match decision {
         PairingMessage::Accepted => {}
         PairingMessage::Rejected => bail!("pairing request rejected by server"),
@@ -1313,7 +1352,7 @@ mod tests {
             trust_store: server_trust_path.clone(),
         };
         let client_config = ClientConfig {
-            target: remote.to_string().parse().unwrap(),
+            target: "linux-desktop.local".parse().unwrap(),
             identity_cert: client_identity.certificate,
             identity_key: client_identity.private_key,
             server_cert: None,
@@ -1322,6 +1361,8 @@ mod tests {
             device_name: "macmini".to_owned(),
             trust_store: client_trust_path.clone(),
         };
+        let reconnect_server_config = server_config.clone();
+        let reconnect_client_config = client_config.clone();
         let (server_events, mut server_event_rx) = test_event_bus();
         let (client_events, mut client_event_rx) = test_event_bus();
         let (decision_tx, mut decision_rx) = mpsc::channel(1);
@@ -1331,16 +1372,19 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let connection = transport::accept_one(&server_endpoint).await.unwrap();
             let mut trust = TrustStore::load(&server_config.trust_store).unwrap();
-            authorize_host_peer(
+            let mut rate_limiter = PairingRateLimiter::default();
+            let authorized = authorize_host_peer(
                 &connection,
                 &server_config,
                 &mut trust,
+                &mut rate_limiter,
                 &mut decision_rx,
                 &mut server_stop,
                 &server_events,
             )
             .await
-            .unwrap()
+            .unwrap();
+            (authorized, connection, server_endpoint)
         });
         let connection = transport::connect(&client_endpoint, remote).await.unwrap();
         let client_task = tokio::spawn(async move {
@@ -1377,9 +1421,21 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(server_task.await.unwrap());
-        let (client_authorized, _connection) = client_task.await.unwrap();
+        let (server_authorized, first_server_connection, first_server_endpoint) =
+            server_task.await.unwrap();
+        assert!(server_authorized);
+        let (client_authorized, first_connection) = client_task.await.unwrap();
         assert!(client_authorized);
+        first_connection.close(0_u32.into(), b"test pairing complete");
+        first_server_connection.close(0_u32.into(), b"test pairing complete");
+        first_server_endpoint.close(0_u32.into(), b"test pairing complete");
+        drop(first_connection);
+        client_endpoint.close(0_u32.into(), b"test pairing complete");
+        first_server_endpoint.wait_idle().await;
+        client_endpoint.wait_idle().await;
+        drop(first_server_connection);
+        drop(first_server_endpoint);
+        drop(client_endpoint);
         drop((server_stop_tx, client_stop_tx));
 
         let server_trust = TrustStore::load(server_trust_path).unwrap();
@@ -1389,8 +1445,80 @@ mod tests {
         ));
         let client_trust = TrustStore::load(client_trust_path).unwrap();
         assert!(matches!(
-            client_trust.verify_endpoint(&remote.to_string(), &server_certificate),
+            client_trust.verify_endpoint("linux-desktop.local:24801", &server_certificate),
             VerifyPeer::Trusted(_)
+        ));
+
+        let reconnect_server_identity = IdentityPaths {
+            certificate: reconnect_server_config.cert.clone(),
+            private_key: reconnect_server_config.key.clone(),
+        };
+        let reconnect_client_identity = IdentityPaths {
+            certificate: reconnect_client_config.identity_cert.clone(),
+            private_key: reconnect_client_config.identity_key.clone(),
+        };
+        let reconnect_server_endpoint = transport::pairing_server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            &reconnect_server_identity,
+        )
+        .unwrap();
+        let reconnect_remote = reconnect_server_endpoint.local_addr().unwrap();
+        let reconnect_client_endpoint = transport::pairing_client_endpoint(
+            "0.0.0.0:0".parse().unwrap(),
+            &reconnect_client_identity,
+        )
+        .unwrap();
+        let (reconnect_server_events, mut reconnect_server_event_rx) = test_event_bus();
+        let (reconnect_client_events, mut reconnect_client_event_rx) = test_event_bus();
+        let (unused_decision_tx, mut unused_decision_rx) = mpsc::channel(1);
+        let (reconnect_server_stop_tx, mut reconnect_server_stop) = watch::channel(false);
+        let (reconnect_client_stop_tx, mut reconnect_client_stop) = watch::channel(false);
+        let reconnect_server_task = tokio::spawn(async move {
+            let connection = transport::accept_one(&reconnect_server_endpoint)
+                .await
+                .unwrap();
+            let mut trust = TrustStore::load(&reconnect_server_config.trust_store).unwrap();
+            let mut limiter = PairingRateLimiter::default();
+            let authorized = authorize_host_peer(
+                &connection,
+                &reconnect_server_config,
+                &mut trust,
+                &mut limiter,
+                &mut unused_decision_rx,
+                &mut reconnect_server_stop,
+                &reconnect_server_events,
+            )
+            .await
+            .unwrap();
+            (authorized, connection)
+        });
+        let reconnect_connection = transport::connect(&reconnect_client_endpoint, reconnect_remote)
+            .await
+            .unwrap();
+        let reconnect_client_task = tokio::spawn(async move {
+            let mut trust = TrustStore::load(&reconnect_client_config.trust_store).unwrap();
+            let authorized = authorize_server_peer(
+                &reconnect_connection,
+                &reconnect_client_config,
+                &mut trust,
+                &reconnect_client_events,
+                &mut reconnect_client_stop,
+            )
+            .await
+            .unwrap();
+            (authorized, reconnect_connection)
+        });
+        let (server_authorized, server_connection) = reconnect_server_task.await.unwrap();
+        let (client_authorized, client_connection) = reconnect_client_task.await.unwrap();
+        assert!(server_authorized && client_authorized);
+        assert!(reconnect_server_event_rx.try_recv().is_err());
+        assert!(reconnect_client_event_rx.try_recv().is_err());
+        drop((
+            server_connection,
+            client_connection,
+            unused_decision_tx,
+            reconnect_server_stop_tx,
+            reconnect_client_stop_tx,
         ));
     }
 
@@ -1404,6 +1532,29 @@ mod tests {
             classify_fault(&anyhow::anyhow!("grant Accessibility permission")).kind,
             FaultKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn pairing_requests_are_limited_per_source_and_recover_after_the_window() {
+        let mut limiter = PairingRateLimiter::default();
+        let now = tokio::time::Instant::now();
+        let source: IpAddr = "192.168.1.20".parse().unwrap();
+        for _ in 0..5 {
+            assert!(limiter.allow(source, now));
+        }
+        assert!(!limiter.allow(source, now));
+        assert!(limiter.allow(source, now + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn pairing_requests_are_limited_globally() {
+        let mut limiter = PairingRateLimiter::default();
+        let now = tokio::time::Instant::now();
+        for host in 1..=20 {
+            let source = IpAddr::V4(Ipv4Addr::new(10, 0, 0, host));
+            assert!(limiter.allow(source, now));
+        }
+        assert!(!limiter.allow(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)), now));
     }
 
     #[test]
