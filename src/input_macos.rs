@@ -23,7 +23,6 @@ const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
 
 type CGEventRef = *mut c_void;
-type CGEventSourceRef = *mut c_void;
 type CFMachPortRef = *mut c_void;
 type CFRunLoopRef = *mut c_void;
 type CFRunLoopSourceRef = *mut c_void;
@@ -54,27 +53,29 @@ struct CGRect {
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
-    fn CGEventSourceCreate(state_id: i32) -> CGEventSourceRef;
-    fn CGEventCreate(source: CGEventSourceRef) -> CGEventRef;
+    fn AXIsProcessTrusted() -> bool;
+    fn CGEventCreate(source: *mut c_void) -> CGEventRef;
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     fn CGEventCreateMouseEvent(
-        source: CGEventSourceRef,
+        source: *mut c_void,
         mouse_type: u32,
         position: CGPoint,
         button: u32,
     ) -> CGEventRef;
     fn CGEventCreateKeyboardEvent(
-        source: CGEventSourceRef,
+        source: *mut c_void,
         virtual_key: u16,
         key_down: bool,
     ) -> CGEventRef;
     fn CGEventCreateScrollWheelEvent(
-        source: CGEventSourceRef,
+        source: *mut c_void,
         units: u32,
         wheel_count: u32,
         ...
     ) -> CGEventRef;
     fn CGEventPost(tap: u32, event: CGEventRef);
+    fn CGEventSetFlags(event: CGEventRef, flags: u64);
+    fn CGEventGetFlags(event: CGEventRef) -> u64;
     fn CGEventTapCreate(
         tap: u32,
         place: u32,
@@ -87,6 +88,9 @@ unsafe extern "C" {
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
     fn CGMainDisplayID() -> u32;
     fn CGDisplayBounds(display: u32) -> CGRect;
+    fn CGDisplayShowCursor(display: u32) -> i32;
+    fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
+    fn CGWarpMouseCursorPosition(position: CGPoint) -> i32;
     fn CFRelease(value: *const c_void);
 }
 
@@ -117,6 +121,11 @@ const EVENT_SCROLL: u32 = 22;
 const EVENT_OTHER_DOWN: u32 = 25;
 const EVENT_OTHER_UP: u32 = 26;
 const EVENT_OTHER_DRAGGED: u32 = 27;
+const FLAG_CAPS_LOCK: u64 = 1 << 16;
+const FLAG_SHIFT: u64 = 1 << 17;
+const FLAG_CONTROL: u64 = 1 << 18;
+const FLAG_OPTION: u64 = 1 << 19;
+const FLAG_COMMAND: u64 = 1 << 20;
 
 struct CaptureContext {
     reliable: mpsc::Sender<ReliableEvent>,
@@ -291,13 +300,16 @@ fn handle_captured_event(context: &CaptureContext, event_type: u32, event: CGEve
         EVENT_FLAGS_CHANGED => {
             let mac_code = event_field(event, 9) as u16;
             if let Some(code) = macos_key_to_linux(mac_code) {
+                let down = modifier_flag(mac_code)
+                    .is_some_and(|flag| unsafe { CGEventGetFlags(event) } & flag != 0);
                 let value = {
                     let mut modifiers = context.modifiers.lock().unwrap();
-                    if modifiers.remove(&code) {
-                        0
-                    } else {
+                    if down {
                         modifiers.insert(code);
                         1
+                    } else {
+                        modifiers.remove(&code);
+                        0
                     }
                 };
                 send_key(context, code, value);
@@ -344,17 +356,19 @@ fn send_reliable(context: &CaptureContext, event_type: u16, code: u16, value: i3
     }
 }
 
+#[derive(Default)]
 pub struct Injector {
-    source: CGEventSourceRef,
+    modifiers: HashSet<u16>,
 }
 
 impl Injector {
     pub fn new() -> Result<Self> {
-        let source = unsafe { CGEventSourceCreate(1) };
-        if source.is_null() {
-            bail!("create macOS HID event source");
+        if !unsafe { AXIsProcessTrusted() } {
+            bail!(
+                "macOS Accessibility permission is required to inject input; enable the terminal or rflow in System Settings > Privacy & Security > Accessibility, then restart it"
+            );
         }
-        Ok(Self { source })
+        Ok(Self::default())
     }
 
     pub fn emit_motion(&mut self, dx: i32, dy: i32) -> Result<()> {
@@ -370,13 +384,22 @@ impl Injector {
     }
 
     pub fn set_cursor_position(&mut self, x: i32, y: i32) -> Result<()> {
-        self.post_mouse(
-            EVENT_MOUSE_MOVED,
-            CGPoint {
-                x: x.max(0) as f64,
-                y: y.max(0) as f64,
+        check_cg_error(
+            unsafe { CGDisplayShowCursor(CGMainDisplayID()) },
+            "show macOS cursor",
+        )?;
+        check_cg_error(
+            unsafe { CGAssociateMouseAndMouseCursorPosition(true) },
+            "associate macOS mouse and cursor",
+        )?;
+        check_cg_error(
+            unsafe {
+                CGWarpMouseCursorPosition(CGPoint {
+                    x: x.max(0) as f64,
+                    y: y.max(0) as f64,
+                })
             },
-            0,
+            "warp macOS cursor",
         )
     }
 
@@ -401,14 +424,29 @@ impl Injector {
             tracing::debug!(code, "ignoring unmapped Linux key code on macOS");
             return Ok(());
         };
-        let event = unsafe { CGEventCreateKeyboardEvent(self.source, keycode, value != 0) };
-        post_and_release(event, "create macOS keyboard event")
+        if value == 0 {
+            self.modifiers.remove(&code);
+        } else if is_linux_modifier(code) {
+            self.modifiers.insert(code);
+        }
+        let event =
+            unsafe { CGEventCreateKeyboardEvent(std::ptr::null_mut(), keycode, value != 0) };
+        post_with_flags_and_release(
+            event,
+            modifier_flags(&self.modifiers),
+            "create macOS keyboard event",
+        )
     }
 
     fn emit_scroll(&mut self, vertical: i32, horizontal: i32) -> Result<()> {
-        let event =
-            unsafe { CGEventCreateScrollWheelEvent(self.source, 1, 2, vertical, horizontal) };
-        post_and_release(event, "create macOS scroll event")
+        let event = unsafe {
+            CGEventCreateScrollWheelEvent(std::ptr::null_mut(), 1, 2, vertical, horizontal)
+        };
+        post_with_flags_and_release(
+            event,
+            modifier_flags(&self.modifiers),
+            "create macOS scroll event",
+        )
     }
 
     fn pointer_position(&self) -> Result<CGPoint> {
@@ -422,14 +460,13 @@ impl Injector {
     }
 
     fn post_mouse(&self, event_type: u32, position: CGPoint, button: u32) -> Result<()> {
-        let event = unsafe { CGEventCreateMouseEvent(self.source, event_type, position, button) };
-        post_and_release(event, "create macOS mouse event")
-    }
-}
-
-impl Drop for Injector {
-    fn drop(&mut self) {
-        unsafe { CFRelease(self.source) };
+        let event =
+            unsafe { CGEventCreateMouseEvent(std::ptr::null_mut(), event_type, position, button) };
+        post_with_flags_and_release(
+            event,
+            modifier_flags(&self.modifiers),
+            "create macOS mouse event",
+        )
     }
 }
 
@@ -442,6 +479,57 @@ fn post_and_release(event: CGEventRef, message: &str) -> Result<()> {
         CFRelease(event);
     }
     Ok(())
+}
+
+fn post_with_flags_and_release(event: CGEventRef, flags: u64, message: &str) -> Result<()> {
+    if event.is_null() {
+        bail!("{message}");
+    }
+    unsafe { CGEventSetFlags(event, flags) };
+    post_and_release(event, message)
+}
+
+fn check_cg_error(error: i32, operation: &str) -> Result<()> {
+    if error == 0 {
+        Ok(())
+    } else {
+        bail!("{operation} failed with CGError {error}")
+    }
+}
+
+fn modifier_flag(mac_code: u16) -> Option<u64> {
+    match mac_code {
+        54 | 55 => Some(FLAG_COMMAND),
+        56 | 60 => Some(FLAG_SHIFT),
+        57 => Some(FLAG_CAPS_LOCK),
+        58 | 61 => Some(FLAG_OPTION),
+        59 | 62 => Some(FLAG_CONTROL),
+        _ => None,
+    }
+}
+
+fn is_linux_modifier(code: u16) -> bool {
+    matches!(code, 29 | 42 | 54 | 56 | 58 | 97 | 100 | 125 | 126)
+}
+
+fn modifier_flags(modifiers: &HashSet<u16>) -> u64 {
+    let mut flags = 0;
+    if modifiers.contains(&58) {
+        flags |= FLAG_CAPS_LOCK;
+    }
+    if modifiers.contains(&42) || modifiers.contains(&54) {
+        flags |= FLAG_SHIFT;
+    }
+    if modifiers.contains(&29) || modifiers.contains(&97) {
+        flags |= FLAG_CONTROL;
+    }
+    if modifiers.contains(&56) || modifiers.contains(&100) {
+        flags |= FLAG_OPTION;
+    }
+    if modifiers.contains(&125) || modifiers.contains(&126) {
+        flags |= FLAG_COMMAND;
+    }
+    flags
 }
 
 fn mouse_button(code: u16) -> Option<(u32, u32, u32)> {
@@ -515,7 +603,8 @@ fn linux_key_to_macos(code: u16) -> Option<u16> {
         109 => 121,
         110 => 114,
         111 => 117,
-        125 | 126 => 55,
+        125 => 55,
+        126 => 54,
         _ => return None,
     })
 }
@@ -618,6 +707,8 @@ mod tests {
         assert_eq!(linux_key_to_macos(28), Some(36));
         assert_eq!(linux_key_to_macos(103), Some(126));
         assert_eq!(linux_key_to_macos(700), None);
+        assert_eq!(linux_key_to_macos(125), Some(55));
+        assert_eq!(linux_key_to_macos(126), Some(54));
     }
 
     #[test]
@@ -626,5 +717,23 @@ mod tests {
         assert_eq!(macos_key_to_linux(36), Some(28));
         assert_eq!(macos_key_to_linux(126), Some(103));
         assert_eq!(macos_key_to_linux(700), None);
+    }
+
+    #[test]
+    fn builds_flags_from_left_and_right_modifiers() {
+        let modifiers = HashSet::from([42, 97, 100, 126]);
+        assert_eq!(
+            modifier_flags(&modifiers),
+            FLAG_SHIFT | FLAG_CONTROL | FLAG_OPTION | FLAG_COMMAND
+        );
+    }
+
+    #[test]
+    fn maps_macos_modifier_keys_to_their_flag_groups() {
+        assert_eq!(modifier_flag(54), Some(FLAG_COMMAND));
+        assert_eq!(modifier_flag(60), Some(FLAG_SHIFT));
+        assert_eq!(modifier_flag(61), Some(FLAG_OPTION));
+        assert_eq!(modifier_flag(62), Some(FLAG_CONTROL));
+        assert_eq!(modifier_flag(0), None);
     }
 }

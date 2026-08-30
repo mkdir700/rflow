@@ -153,17 +153,28 @@ async fn host_connection(
     let _capture_threads = spawn_capture(devices, true, reliable_tx, motion_tx);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     let mut heartbeat_sequence = 0_u64;
+    let mut physical_pressed = PressedState::default();
 
     loop {
         tokio::select! {
             event = reliable_rx.recv() => {
                 let Some(event) = event else { bail!("all host input capture threads stopped") };
+                if let ReliableEvent::Input { event_type, code, value, .. } = &event {
+                    physical_pressed.observe(*event_type, *code, *value);
+                }
                 route_reliable(router.active(), &mut local_injector, &mut remote_stream, event).await?;
             }
             changed = motion_rx.changed() => {
                 changed.context("all host pointer capture threads stopped")?;
                 if let Some(motion) = *motion_rx.borrow_and_update() {
-                    route_motion(&connection, &mut remote_stream, &mut local_injector, &mut router, motion).await?;
+                    route_motion(
+                        &connection,
+                        &mut remote_stream,
+                        &mut local_injector,
+                        &mut router,
+                        &physical_pressed,
+                        motion,
+                    ).await?;
                 }
             }
             _ = heartbeat.tick() => {
@@ -208,6 +219,7 @@ async fn route_motion(
     remote_stream: &mut SendStream,
     local: &mut Injector,
     router: &mut CursorRouter,
+    physical_pressed: &PressedState,
     motion: Motion,
 ) -> Result<()> {
     match router.route_motion(motion.dx, motion.dy) {
@@ -220,13 +232,38 @@ async fn route_motion(
         }
         Route::EnterRemote { x, y } => {
             tracing::info!(x, y, "cursor entered client screen");
-            write_reliable(remote_stream, &ReliableEvent::EnterScreen { x, y }).await
+            for (event_type, code) in physical_pressed.held_inputs() {
+                local.emit_raw(event_type, code, 0)?;
+            }
+            write_reliable(remote_stream, &ReliableEvent::EnterScreen { x, y }).await?;
+            replay_held_inputs(remote_stream, physical_pressed).await
         }
         Route::EnterLocal { x, y } => {
             tracing::info!(x, y, "cursor returned to host screen");
-            local.set_cursor_position(x, y)
+            write_reliable(remote_stream, &ReliableEvent::ReleaseAll).await?;
+            local.set_cursor_position(x, y)?;
+            for (event_type, code) in physical_pressed.held_inputs() {
+                local.emit_raw(event_type, code, 1)?;
+            }
+            Ok(())
         }
     }
+}
+
+async fn replay_held_inputs(stream: &mut SendStream, pressed: &PressedState) -> Result<()> {
+    for (event_type, code) in pressed.held_inputs() {
+        write_reliable(
+            stream,
+            &ReliableEvent::Input {
+                sequence: 0,
+                event_type,
+                code,
+                value: 1,
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn client(to: SocketAddr, cert: PathBuf, requested_size: Option<ScreenSize>) -> Result<()> {

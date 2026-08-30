@@ -30,6 +30,11 @@ A Linux host must be allowed to read its selected `/dev/input/event*` devices an
 Accessibility and Input Monitoring permission for the terminal or `rflow`. Distribution packages
 commonly provide an `input` group, but group names and recommended udev policy vary.
 
+On macOS, enable the actual process launching `rflow` under **System Settings → Privacy &
+Security → Accessibility**, then restart that process. If you run the binary from Terminal or
+iTerm, authorize that terminal application. A macOS client refuses to inject input when this
+permission is missing instead of connecting in a partially working state.
+
 ## Quick start
 
 On the host—the computer with the physical keyboard and mouse—generate its identity once:
@@ -69,6 +74,10 @@ RUST_LOG=rflow=info rflow client 192.168.1.50:24801 \
 The host grabs the selected physical devices and reinjects them locally while its own screen is
 active. Keep SSH or another independent input device available during MVP testing. When the cursor
 is on the client, Ctrl-C is routed to the client rather than the host terminal.
+
+Crossing a screen boundary releases held keys and mouse buttons on the old screen and replays them
+on the new screen. This prevents modifiers such as Super/Command from remaining stuck while still
+allowing a modifier to be held across the boundary.
 
 ## Latency design
 

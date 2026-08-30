@@ -44,6 +44,10 @@ impl PressedState {
     pub fn drain_releases(&mut self) -> Vec<(u16, u16)> {
         std::mem::take(&mut self.pressed).into_iter().collect()
     }
+
+    pub fn held_inputs(&self) -> impl Iterator<Item = (u16, u16)> + '_ {
+        self.pressed.iter().copied()
+    }
 }
 
 #[cfg(test)]
@@ -83,5 +87,20 @@ mod tests {
         let mut state = PressedState::default();
         state.observe(2, 8, 1);
         assert!(state.drain_releases().is_empty());
+    }
+
+    #[test]
+    fn held_inputs_preserve_physical_state_across_screen_transfers() {
+        let mut state = PressedState::default();
+        state.observe(1, 125, 1);
+        state.observe(1, 30, 1);
+
+        assert_eq!(
+            state.held_inputs().collect::<Vec<_>>(),
+            vec![(1, 30), (1, 125)]
+        );
+
+        state.observe(1, 30, 0);
+        assert_eq!(state.held_inputs().collect::<Vec<_>>(), vec![(1, 125)]);
     }
 }
