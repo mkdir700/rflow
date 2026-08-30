@@ -52,7 +52,7 @@ Start the host. rflow detects the host's active screens, logical dimensions, key
 automatically:
 
 ```bash
-rflow host
+rflow host -v
 ```
 
 Add `-v` for debug logs or `-vv` for full trace logs when diagnosing a runtime problem. The option
