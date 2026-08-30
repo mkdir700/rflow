@@ -1,12 +1,12 @@
 use std::{
-    io::{self, IsTerminal, Write},
+    io::{self, BufRead, IsTerminal, Write},
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand};
 use rflow::{
     core::{
@@ -20,13 +20,16 @@ use rflow::{
     },
     pairing::PairingRequestId,
     runtime::{
-        AppCommand, AppEvent, ClientConfig, HostConfig, RuntimeHandle, RuntimeStatus,
-        TracingDiagnostics,
+        AppCommand, AppEvent, ClientConfig, HostConfig, PlacementRequestSummary, RuntimeHandle,
+        RuntimeStatus, TracingDiagnostics,
     },
     target::ServerTarget,
     transport,
     trust::default_trust_store_path,
 };
+
+#[cfg(test)]
+use rflow::runtime::{PlacementOptionSummary, PlacementScreenSummary};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Low-latency virtual KVM over QUIC")]
@@ -668,6 +671,150 @@ async fn submit_pairing_decision(request_id: PairingRequestId, accepted: bool) -
     }
 }
 
+#[derive(Debug)]
+enum TerminalPrompt {
+    Pairing(Box<rflow::runtime::PairingRequestSummary>),
+    Placement(Box<PlacementRequestSummary>),
+}
+
+#[derive(Debug)]
+enum TerminalPromptResponse {
+    Pairing(PairingRequestId, bool),
+    Placement(std::result::Result<Option<PlacementDecision>, String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlacementDecision {
+    revision: u64,
+    screen_id: ScreenId,
+    anchor_id: ScreenId,
+    position: RelativePosition,
+}
+
+fn placement_position_name(position: RelativePosition) -> &'static str {
+    match position {
+        RelativePosition::LeftOf => "Left",
+        RelativePosition::RightOf => "Right",
+        RelativePosition::Above => "Above",
+        RelativePosition::Below => "Below",
+    }
+}
+
+fn prompt_peer_placement(
+    request: &PlacementRequestSummary,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> io::Result<Option<PlacementDecision>> {
+    writeln!(
+        output,
+        "\nPlace new device {} relative to {}",
+        request.device_name, request.anchor_name
+    )?;
+    let screen_index = if request.screens.len() == 1 {
+        0
+    } else {
+        writeln!(output, "\nScreens")?;
+        for (index, screen) in request.screens.iter().enumerate() {
+            writeln!(
+                output,
+                "  {}) {} ({})",
+                index + 1,
+                screen.name,
+                screen.screen_id.0
+            )?;
+        }
+        loop {
+            write!(
+                output,
+                "Choose a screen [1-{}, 0=later]: ",
+                request.screens.len()
+            )?;
+            output.flush()?;
+            let choice = match read_prompt_choice(input)? {
+                PromptChoice::End => return Ok(None),
+                PromptChoice::Invalid => {
+                    writeln!(output, "Invalid screen choice.")?;
+                    continue;
+                }
+                PromptChoice::Value(choice) => choice,
+            };
+            if choice == 0 {
+                return Ok(None);
+            }
+            if (1..=request.screens.len()).contains(&choice) {
+                break choice - 1;
+            }
+            writeln!(output, "Invalid screen choice.")?;
+        }
+    };
+    let screen = &request.screens[screen_index];
+    writeln!(output, "\nPosition for {}", screen.name)?;
+    for (index, option) in screen.options.iter().enumerate() {
+        if option.occupied_by.is_empty() {
+            writeln!(
+                output,
+                "  {}) {}",
+                index + 1,
+                placement_position_name(option.position)
+            )?;
+        } else {
+            writeln!(
+                output,
+                "  {}) {} [unavailable: occupied by {}]",
+                index + 1,
+                placement_position_name(option.position),
+                option.occupied_by.join(", ")
+            )?;
+        }
+    }
+    loop {
+        write!(output, "Choose a position [1-4, 0=later]: ")?;
+        output.flush()?;
+        let choice = match read_prompt_choice(input)? {
+            PromptChoice::End => return Ok(None),
+            PromptChoice::Invalid => {
+                writeln!(output, "Invalid position choice.")?;
+                continue;
+            }
+            PromptChoice::Value(choice) => choice,
+        };
+        if choice == 0 {
+            return Ok(None);
+        }
+        let Some(option) = screen.options.get(choice.saturating_sub(1)) else {
+            writeln!(output, "Invalid position choice.")?;
+            continue;
+        };
+        if !option.occupied_by.is_empty() {
+            writeln!(output, "That position is unavailable.")?;
+            continue;
+        }
+        return Ok(Some(PlacementDecision {
+            revision: request.revision,
+            screen_id: screen.screen_id.clone(),
+            anchor_id: request.anchor_screen.clone(),
+            position: option.position,
+        }));
+    }
+}
+
+enum PromptChoice {
+    End,
+    Invalid,
+    Value(usize),
+}
+
+fn read_prompt_choice(input: &mut impl BufRead) -> io::Result<PromptChoice> {
+    let mut answer = String::new();
+    if input.read_line(&mut answer)? == 0 {
+        return Ok(PromptChoice::End);
+    }
+    Ok(match answer.trim().parse() {
+        Ok(choice) => PromptChoice::Value(choice),
+        Err(_) => PromptChoice::Invalid,
+    })
+}
+
 async fn run_session(command: Command) -> Result<()> {
     let app_command = command.into_app_command()?;
     let is_host = matches!(app_command, AppCommand::StartHost(_));
@@ -678,6 +825,7 @@ async fn run_session(command: Command) -> Result<()> {
     };
 
     let mut runtime = RuntimeHandle::spawn(Arc::new(TracingDiagnostics))?;
+    let application = runtime.application_handle();
     let management = if is_host {
         match ManagementServer::bind(default_endpoint_path()?, runtime.application_handle()).await {
             Ok(management) => Some(management),
@@ -690,7 +838,50 @@ async fn run_session(command: Command) -> Result<()> {
         None
     };
     runtime.send(app_command).await?;
-    let (prompt_tx, mut prompt_rx) = tokio::sync::mpsc::channel(4);
+    let interactive = io::stdin().is_terminal();
+    let (prompt_request_tx, mut prompt_request_rx) = tokio::sync::mpsc::channel(8);
+    let (prompt_response_tx, mut prompt_response_rx) = tokio::sync::mpsc::channel(8);
+    if interactive {
+        std::thread::Builder::new()
+            .name("rflow-terminal-prompts".to_owned())
+            .spawn(move || {
+                let stdin = io::stdin();
+                let mut input = stdin.lock();
+                let stdout = io::stdout();
+                let mut output = stdout.lock();
+                while let Some(prompt) = prompt_request_rx.blocking_recv() {
+                    let response = match prompt {
+                        TerminalPrompt::Pairing(request) => {
+                            let _ = writeln!(
+                                output,
+                                "\nPairing request\n\nRequest: {}\nDevice: {}\nAddress: {}\nFingerprint: {}\nPairing code: {}\n",
+                                request.request_id,
+                                request.device_name,
+                                request.address,
+                                request.fingerprint,
+                                request.code,
+                            );
+                            let _ = write!(output, "Accept this device? [y/N] ");
+                            let _ = output.flush();
+                            let mut answer = String::new();
+                            let accepted = input.read_line(&mut answer).is_ok()
+                                && matches!(
+                                    answer.trim().to_ascii_lowercase().as_str(),
+                                    "y" | "yes"
+                                );
+                            TerminalPromptResponse::Pairing(request.request_id, accepted)
+                        }
+                        TerminalPrompt::Placement(request) => TerminalPromptResponse::Placement(
+                            prompt_peer_placement(&request, &mut input, &mut output)
+                                .map_err(|error| error.to_string()),
+                        ),
+                    };
+                    if prompt_response_tx.blocking_send(response).is_err() {
+                        break;
+                    }
+                }
+            })?;
+    }
     let mut fault = None;
     let mut previous_control = None;
     loop {
@@ -723,34 +914,21 @@ async fn run_session(command: Command) -> Result<()> {
                 }
                 Some(AppEvent::ConfigChanged(_)) => {}
                 Some(AppEvent::PairingRequested(request)) => {
-                    println!(
-                        "\nPairing request\n\nRequest: {}\nDevice: {}\nAddress: {}\nFingerprint: {}\nPairing code: {}\n",
-                        request.request_id,
-                        request.device_name,
-                        request.address,
-                        request.fingerprint,
-                        request.code,
-                    );
-                    if io::stdin().is_terminal() {
-                        print!("Accept this device? [y/N] ");
-                        io::stdout().flush()?;
-                        let prompt_tx = prompt_tx.clone();
-                        let request_id = request.request_id;
-                        std::thread::Builder::new()
-                            .name("rflow-pairing-prompt".to_owned())
-                            .spawn(move || {
-                                let mut answer = String::new();
-                                let accepted = io::stdin().read_line(&mut answer).is_ok()
-                                    && matches!(
-                                        answer.trim().to_ascii_lowercase().as_str(),
-                                        "y" | "yes"
-                                    );
-                                let _ = prompt_tx.blocking_send((request_id, accepted));
-                            })?;
+                    if interactive {
+                        prompt_request_tx
+                            .send(TerminalPrompt::Pairing(request))
+                            .await
+                            .context("terminal prompt worker stopped")?;
                     } else {
                         println!(
-                            "No interactive terminal; decide with `rflow peers accept {}` or `rflow peers reject {}`.",
-                            request.request_id, request.request_id
+                            "\nPairing request\n\nRequest: {}\nDevice: {}\nAddress: {}\nFingerprint: {}\nPairing code: {}\n\nNo interactive terminal; decide with `rflow peers accept {}` or `rflow peers reject {}`.",
+                            request.request_id,
+                            request.device_name,
+                            request.address,
+                            request.fingerprint,
+                            request.code,
+                            request.request_id,
+                            request.request_id
                         );
                     }
                 }
@@ -765,6 +943,19 @@ async fn run_session(command: Command) -> Result<()> {
                 Some(AppEvent::PeerTrusted(peer)) => {
                     tracing::info!(device_id = %peer.device_id, name = %peer.display_name, "peer trusted");
                 }
+                Some(AppEvent::PlacementRequested(request)) => {
+                    if interactive {
+                        prompt_request_tx
+                            .send(TerminalPrompt::Placement(request))
+                            .await
+                            .context("terminal prompt worker stopped")?;
+                    } else {
+                        println!(
+                            "New device {} is unplaced. Run `rflow layout place <screen> --right-of <local-screen>` to place it later.",
+                            request.device_name
+                        );
+                    }
+                }
                 Some(AppEvent::TopologyChanged(_)) => {}
                 Some(AppEvent::Faulted(error)) => {
                     fault = Some(error);
@@ -772,22 +963,47 @@ async fn run_session(command: Command) -> Result<()> {
                 }
                 None => bail!("rflow runtime stopped without a terminal event"),
             },
-            Some((request_id, accepted)) = prompt_rx.recv() => {
-                if runtime
-                    .snapshot()
-                    .pairing
-                    .as_ref()
-                    .is_some_and(|request| request.request_id == request_id)
-                {
-                    runtime
-                        .send(if accepted {
-                            AppCommand::AcceptPairing(request_id)
-                        } else {
-                            AppCommand::RejectPairing(request_id)
-                        })
-                        .await?;
+            Some(response) = prompt_response_rx.recv() => match response {
+                TerminalPromptResponse::Pairing(request_id, accepted) => {
+                    if runtime
+                        .snapshot()
+                        .pairing
+                        .as_ref()
+                        .is_some_and(|request| request.request_id == request_id)
+                    {
+                        runtime
+                            .send(if accepted {
+                                AppCommand::AcceptPairing(request_id)
+                            } else {
+                                AppCommand::RejectPairing(request_id)
+                            })
+                            .await?;
+                    }
                 }
-            }
+                TerminalPromptResponse::Placement(Ok(Some(decision))) => {
+                    match application
+                        .apply_layout(
+                            decision.revision,
+                            LayoutCommand::Place {
+                                screen_id: decision.screen_id,
+                                anchor_id: decision.anchor_id,
+                                position: decision.position,
+                                replace: false,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(topology) => println!("Layout updated to revision {}.", topology.revision),
+                        Err(error) => eprintln!("Could not place the new device: {error:#}"),
+                    }
+                }
+                TerminalPromptResponse::Placement(Ok(None)) => {
+                    println!("Device left unplaced. Configure it later with `rflow layout place`.");
+                }
+                TerminalPromptResponse::Placement(Err(error)) => {
+                    eprintln!("Could not read placement choice: {error}");
+                }
+            },
             signal = tokio::signal::ctrl_c() => {
                 signal?;
                 runtime.send(AppCommand::Stop).await?;
@@ -1202,6 +1418,58 @@ mod tests {
             }
         ));
         assert!(Cli::try_parse_from(["rflow", "peers", "reject", "42"]).is_err());
+    }
+
+    #[test]
+    fn placement_prompt_marks_occupied_positions_and_rejects_them() {
+        let options = vec![
+            PlacementOptionSummary {
+                position: RelativePosition::LeftOf,
+                occupied_by: Vec::new(),
+            },
+            PlacementOptionSummary {
+                position: RelativePosition::RightOf,
+                occupied_by: vec!["existing/display".into()],
+            },
+            PlacementOptionSummary {
+                position: RelativePosition::Above,
+                occupied_by: Vec::new(),
+            },
+            PlacementOptionSummary {
+                position: RelativePosition::Below,
+                occupied_by: Vec::new(),
+            },
+        ];
+        let request = PlacementRequestSummary {
+            device_name: "macmini".into(),
+            revision: 7,
+            anchor_screen: ScreenId("host/main".into()),
+            anchor_name: "host/main".into(),
+            screens: vec![
+                PlacementScreenSummary {
+                    screen_id: ScreenId("macmini/main".into()),
+                    name: "main".into(),
+                    options: options.clone(),
+                },
+                PlacementScreenSummary {
+                    screen_id: ScreenId("macmini/secondary".into()),
+                    name: "secondary".into(),
+                    options,
+                },
+            ],
+        };
+        let mut input = io::Cursor::new(b"1\n2\n1\n");
+        let mut output = Vec::new();
+
+        let decision = prompt_peer_placement(&request, &mut input, &mut output)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(decision.screen_id, ScreenId("macmini/main".into()));
+        assert_eq!(decision.position, RelativePosition::LeftOf);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Right [unavailable: occupied by existing/display]"));
+        assert!(output.contains("That position is unavailable."));
     }
 
     #[test]

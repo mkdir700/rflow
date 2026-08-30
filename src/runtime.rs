@@ -76,6 +76,28 @@ pub struct PeerSummary {
     pub display_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementOptionSummary {
+    pub position: crate::core::RelativePosition,
+    pub occupied_by: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementScreenSummary {
+    pub screen_id: ScreenId,
+    pub name: String,
+    pub options: Vec<PlacementOptionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementRequestSummary {
+    pub device_name: String,
+    pub revision: u64,
+    pub anchor_screen: ScreenId,
+    pub anchor_name: String,
+    pub screens: Vec<PlacementScreenSummary>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppConfig {
     pub host: Option<HostConfig>,
@@ -150,6 +172,7 @@ pub enum AppEvent {
     PairingCleared(PairingRequestId),
     PairingExpired(PairingRequestId),
     PeerTrusted(PeerSummary),
+    PlacementRequested(Box<PlacementRequestSummary>),
     TopologyChanged(ScreenTopology),
     Faulted(AppFault),
 }
@@ -245,7 +268,7 @@ impl AppEventBus {
                     snapshot.pairing = None;
                 }
             }
-            AppEvent::PeerTrusted(_) => {}
+            AppEvent::PeerTrusted(_) | AppEvent::PlacementRequested(_) => {}
             AppEvent::TopologyChanged(topology) => snapshot.topology = topology.clone(),
             AppEvent::Faulted(fault) => snapshot.fault = Some(fault.clone()),
         }
@@ -765,7 +788,7 @@ async fn run_host(
             accepted = transport::accept_one(&endpoint) => {
                 let connection = accepted?;
                 let remote = connection.remote_address();
-                let Some(peer) = authorize_host_peer(
+                let Some(authorized_peer) = authorize_host_peer(
                     &connection,
                     &config,
                     &mut trust,
@@ -777,9 +800,10 @@ async fn run_host(
                     connection.close(0_u32.into(), b"pairing rejected");
                     continue;
                 };
+                let newly_trusted = authorized_peer.newly_trusted;
                 let (host_peer, remote_screens, mut metadata) = prepare_host_peer(
                     connection,
-                    peer,
+                    authorized_peer.summary,
                     &detected_screens,
                     &mut stop,
                 ).await?;
@@ -820,9 +844,10 @@ async fn run_host(
                 let disconnected = disconnected_tx.clone();
                 let inventory_updates = inventory_tx.clone();
                 let inventory_device_id = device_id.clone();
+                let disconnected_device_id = device_id.clone();
                 tokio::spawn(async move {
                     let _ = connection.closed().await;
-                    let _ = disconnected.send((device_id, remote)).await;
+                    let _ = disconnected.send((disconnected_device_id, remote)).await;
                 });
                 tokio::spawn(async move {
                     loop {
@@ -851,6 +876,14 @@ async fn run_host(
                 }
                 events.send(AppEvent::PeerChanged(Some(remote))).await;
                 events.send(AppEvent::TopologyChanged(topology.clone())).await;
+                if let Some(request) = placement_request(
+                    newly_trusted,
+                    host_peer_summary(&peers, &device_id)?,
+                    &inventory,
+                    &topology,
+                )? {
+                    events.send(AppEvent::PlacementRequested(Box::new(request))).await;
+                }
                 publish_status(&events, RuntimeStatus::Connected).await;
                 tracing::info!(%remote, peers = peers.len(), "client connected");
             }
@@ -1071,6 +1104,16 @@ struct HostPeer {
     heartbeat_sequence: u64,
 }
 
+fn host_peer_summary<'a>(
+    peers: &'a HashMap<TopologyDeviceId, HostPeer>,
+    device_id: &TopologyDeviceId,
+) -> Result<&'a PeerSummary> {
+    peers
+        .get(device_id)
+        .map(|peer| &peer.summary)
+        .context("newly connected peer disappeared before placement prompt")
+}
+
 async fn prepare_host_peer(
     connection: Connection,
     summary: PeerSummary,
@@ -1244,7 +1287,7 @@ async fn authorize_host_peer(
     decisions: &mut mpsc::Receiver<PairingDecision>,
     stop: &mut watch::Receiver<bool>,
     events: &AppEventBus,
-) -> Result<Option<PeerSummary>> {
+) -> Result<Option<AuthorizedPeer>> {
     let remote = connection.remote_address();
     let peer_certificate = transport::peer_certificate(connection)?;
     let local_certificate = fs::read(&config.cert).context("read host identity certificate")?;
@@ -1276,9 +1319,12 @@ async fn authorize_host_peer(
         write_typed_frame(&mut send, &PairingMessage::Accepted).await?;
         expect_pairing_acknowledgement(&mut receive).await?;
         send.finish().context("finish pairing stream")?;
-        return Ok(Some(PeerSummary {
-            device_id: DeviceId::from_certificate(&client_material.certificate),
-            display_name: client_name.clone(),
+        return Ok(Some(AuthorizedPeer {
+            summary: PeerSummary {
+                device_id: DeviceId::from_certificate(&client_material.certificate),
+                display_name: client_name.clone(),
+            },
+            newly_trusted: false,
         }));
     }
 
@@ -1344,10 +1390,18 @@ async fn authorize_host_peer(
         }))
         .await;
     send.finish().context("finish pairing stream")?;
-    Ok(Some(PeerSummary {
-        device_id,
-        display_name: client_name,
+    Ok(Some(AuthorizedPeer {
+        summary: PeerSummary {
+            device_id,
+            display_name: client_name,
+        },
+        newly_trusted: true,
     }))
+}
+
+struct AuthorizedPeer {
+    summary: PeerSummary,
+    newly_trusted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1690,6 +1744,77 @@ fn merge_remote_inventory(
             });
         }
     }
+}
+
+fn placement_request(
+    newly_trusted: bool,
+    peer: &PeerSummary,
+    inventory: &ScreenInventory,
+    topology: &ScreenTopology,
+) -> Result<Option<PlacementRequestSummary>> {
+    if !newly_trusted {
+        return Ok(None);
+    }
+    let anchor = inventory
+        .screens
+        .iter()
+        .find(|screen| screen.this_device && screen.online && screen.primary)
+        .or_else(|| {
+            inventory
+                .screens
+                .iter()
+                .find(|screen| screen.this_device && screen.online)
+        })
+        .context("no online local screen is available for peer placement")?;
+    let peer_device_id = TopologyDeviceId(peer.device_id.to_string());
+    let screens = inventory
+        .screens
+        .iter()
+        .filter(|screen| {
+            screen.device_id == peer_device_id
+                && screen.online
+                && !topology.links.iter().any(|link| {
+                    link.from.screen_id == screen.screen_id || link.to.screen_id == screen.screen_id
+                })
+        })
+        .map(|screen| {
+            let options = topology
+                .placement_availability(&anchor.screen_id, &screen.screen_id)
+                .map_err(anyhow::Error::msg)?
+                .into_iter()
+                .map(|availability| PlacementOptionSummary {
+                    position: availability.position,
+                    occupied_by: availability
+                        .occupied_by
+                        .into_iter()
+                        .map(|screen_id| {
+                            topology
+                                .screens
+                                .iter()
+                                .find(|screen| screen.screen_id == screen_id)
+                                .map(|screen| format!("{}/{}", screen.device_name, screen.name))
+                                .unwrap_or(screen_id.0)
+                        })
+                        .collect(),
+                })
+                .collect();
+            Ok(PlacementScreenSummary {
+                screen_id: screen.screen_id.clone(),
+                name: screen.name.clone(),
+                options,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if screens.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(PlacementRequestSummary {
+        device_name: peer.display_name.clone(),
+        revision: topology.revision,
+        anchor_screen: anchor.screen_id.clone(),
+        anchor_name: format!("{}/{}", anchor.device_name, anchor.name),
+        screens,
+    }))
 }
 
 fn migrate_legacy_direction(
@@ -2552,6 +2677,94 @@ mod tests {
                 .screens
                 .iter()
                 .any(|screen| { screen.screen_id.0.ends_with("/b") && !screen.online })
+        );
+    }
+
+    #[test]
+    fn newly_trusted_peer_requests_placement_after_inventory_is_available() {
+        let peer = PeerSummary {
+            device_id: DeviceId([7; 32]),
+            display_name: "peer-b".to_owned(),
+        };
+        let inventory = ScreenInventory {
+            screens: vec![
+                ScreenDescriptor {
+                    screen_id: ScreenId("local".into()),
+                    device_id: TopologyDeviceId("host-id".into()),
+                    device_name: "host".into(),
+                    name: "primary".into(),
+                    logical_size: ScreenSize::new(100, 100).unwrap(),
+                    primary: true,
+                    online: true,
+                    this_device: true,
+                },
+                ScreenDescriptor {
+                    screen_id: ScreenId("candidate".into()),
+                    device_id: TopologyDeviceId(peer.device_id.to_string()),
+                    device_name: "peer-b".into(),
+                    name: "display".into(),
+                    logical_size: ScreenSize::new(100, 100).unwrap(),
+                    primary: true,
+                    online: true,
+                    this_device: false,
+                },
+                ScreenDescriptor {
+                    screen_id: ScreenId("occupied".into()),
+                    device_id: TopologyDeviceId("peer-c-id".into()),
+                    device_name: "peer-c".into(),
+                    name: "display".into(),
+                    logical_size: ScreenSize::new(100, 100).unwrap(),
+                    primary: true,
+                    online: true,
+                    this_device: false,
+                },
+            ],
+        };
+        let layout = crate::core::ScreenLayout {
+            links: vec![crate::core::ScreenLink {
+                from: crate::core::ScreenEdge {
+                    screen_id: ScreenId("local".into()),
+                    edge: crate::core::Edge::Right,
+                },
+                to: crate::core::ScreenEdge {
+                    screen_id: ScreenId("occupied".into()),
+                    edge: crate::core::Edge::Left,
+                },
+            }],
+            ..crate::core::ScreenLayout::default()
+        };
+        let topology = layout.resolve(&inventory).unwrap();
+
+        assert!(
+            placement_request(false, &peer, &inventory, &topology)
+                .unwrap()
+                .is_none()
+        );
+        let request = placement_request(true, &peer, &inventory, &topology)
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.screens.len(), 1);
+        assert_eq!(
+            request.screens[0].options[1].occupied_by,
+            vec!["peer-c/display"]
+        );
+
+        let mut placed_layout = layout;
+        placed_layout.links.push(crate::core::ScreenLink {
+            from: crate::core::ScreenEdge {
+                screen_id: ScreenId("candidate".into()),
+                edge: crate::core::Edge::Left,
+            },
+            to: crate::core::ScreenEdge {
+                screen_id: ScreenId("occupied".into()),
+                edge: crate::core::Edge::Right,
+            },
+        });
+        let placed_topology = placed_layout.resolve(&inventory).unwrap();
+        assert!(
+            placement_request(true, &peer, &inventory, &placed_topology)
+                .unwrap()
+                .is_none()
         );
     }
 

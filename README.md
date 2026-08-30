@@ -76,7 +76,11 @@ switched back to the Linux host before its input devices become available.
 
 On the first connection, both terminals display the same six-digit pairing code. Compare the codes,
 then enter `y` on the host to trust the client. rflow does not grab the host input devices until this
-confirmation succeeds. Both devices remember the trust relationship for later connections.
+confirmation succeeds. After the client reports its screens, an interactive Host also asks where to
+place one unplaced screen relative to the Host's primary screen. Occupied cardinal positions are
+shown as unavailable with the occupying screen; choose `0` to leave the device unplaced. Multi-screen
+clients first ask which screen to place. Both devices remember the trust relationship for later
+connections, which do not repeat either prompt.
 
 Once the peer is connected, inspect the authenticated screen inventory and place its screen. A
 single-screen device name can be used as shorthand; multi-screen devices require an exact screen

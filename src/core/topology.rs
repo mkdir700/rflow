@@ -153,6 +153,21 @@ pub enum RelativePosition {
     Below,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementAvailability {
+    pub position: RelativePosition,
+    pub occupied_by: Vec<ScreenId>,
+}
+
+fn placement_edges(position: RelativePosition) -> (Edge, Edge) {
+    match position {
+        RelativePosition::LeftOf => (Edge::Left, Edge::Right),
+        RelativePosition::RightOf => (Edge::Right, Edge::Left),
+        RelativePosition::Above => (Edge::Top, Edge::Bottom),
+        RelativePosition::Below => (Edge::Bottom, Edge::Top),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LayoutCommand {
     Place {
@@ -277,12 +292,7 @@ impl ScreenLayout {
                 position,
                 replace,
             } => {
-                let (anchor_edge, screen_edge) = match position {
-                    RelativePosition::LeftOf => (Edge::Left, Edge::Right),
-                    RelativePosition::RightOf => (Edge::Right, Edge::Left),
-                    RelativePosition::Above => (Edge::Top, Edge::Bottom),
-                    RelativePosition::Below => (Edge::Bottom, Edge::Top),
-                };
+                let (anchor_edge, screen_edge) = placement_edges(position);
                 self.link(
                     inventory,
                     ScreenEdge {
@@ -440,6 +450,64 @@ impl ScreenTopology {
             }
         }
         Ok(())
+    }
+
+    pub fn placement_availability(
+        &self,
+        anchor_id: &ScreenId,
+        screen_id: &ScreenId,
+    ) -> Result<Vec<PlacementAvailability>, String> {
+        if anchor_id == screen_id {
+            return Err("a screen cannot be placed relative to itself".to_owned());
+        }
+        for id in [anchor_id, screen_id] {
+            if !self.screens.iter().any(|screen| &screen.screen_id == id) {
+                return Err(format!("screen {} is not in the topology", id.0));
+            }
+        }
+        let positions = [
+            RelativePosition::LeftOf,
+            RelativePosition::RightOf,
+            RelativePosition::Above,
+            RelativePosition::Below,
+        ];
+        Ok(positions
+            .into_iter()
+            .map(|position| {
+                let (anchor_edge, screen_edge) = placement_edges(position);
+                let endpoints = [
+                    ScreenEdge {
+                        screen_id: anchor_id.clone(),
+                        edge: anchor_edge,
+                    },
+                    ScreenEdge {
+                        screen_id: screen_id.clone(),
+                        edge: screen_edge,
+                    },
+                ];
+                let mut occupied_by = Vec::new();
+                for link in &self.links {
+                    for endpoint in &endpoints {
+                        let occupant = if link.from == *endpoint {
+                            Some(&link.to.screen_id)
+                        } else if link.to == *endpoint {
+                            Some(&link.from.screen_id)
+                        } else {
+                            None
+                        };
+                        if let Some(occupant) = occupant
+                            && !occupied_by.contains(occupant)
+                        {
+                            occupied_by.push(occupant.clone());
+                        }
+                    }
+                }
+                PlacementAvailability {
+                    position,
+                    occupied_by,
+                }
+            })
+            .collect())
     }
 }
 
@@ -1639,6 +1707,53 @@ mod tests {
             .unwrap();
         assert!(layout.size_overrides.is_empty());
         assert_eq!(layout.revision, 4);
+    }
+
+    #[test]
+    fn placement_availability_names_screens_occupying_either_edge() {
+        let topology = ScreenTopology {
+            revision: 3,
+            screens: vec![
+                node("local"),
+                node("right"),
+                node("candidate"),
+                node("below-candidate"),
+            ],
+            links: vec![
+                ScreenLink {
+                    from: ScreenEdge {
+                        screen_id: ScreenId("local".into()),
+                        edge: Edge::Right,
+                    },
+                    to: ScreenEdge {
+                        screen_id: ScreenId("right".into()),
+                        edge: Edge::Left,
+                    },
+                },
+                ScreenLink {
+                    from: ScreenEdge {
+                        screen_id: ScreenId("candidate".into()),
+                        edge: Edge::Bottom,
+                    },
+                    to: ScreenEdge {
+                        screen_id: ScreenId("below-candidate".into()),
+                        edge: Edge::Top,
+                    },
+                },
+            ],
+        };
+
+        let choices = topology
+            .placement_availability(&ScreenId("local".into()), &ScreenId("candidate".into()))
+            .unwrap();
+
+        assert!(choices[0].occupied_by.is_empty());
+        assert_eq!(choices[1].occupied_by, vec![ScreenId("right".into())]);
+        assert_eq!(
+            choices[2].occupied_by,
+            vec![ScreenId("below-candidate".into())]
+        );
+        assert!(choices[3].occupied_by.is_empty());
     }
 
     fn screen_descriptor(id: &str, device: &str, online: bool) -> ScreenDescriptor {
