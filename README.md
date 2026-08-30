@@ -25,7 +25,7 @@ select the same carrier:
 
 ```bash
 sudo setcap cap_net_raw=ep ./target/release/rflow
-./target/release/rflow host --bind 0.0.0.0:24801
+./target/release/rflow host --transport icmp --bind 0.0.0.0:24801
 ./target/release/rflow client --transport icmp 192.168.1.50:24801
 ```
 
@@ -38,8 +38,7 @@ Raw ICMP sockets require `CAP_NET_RAW` (or root). Prefer granting only that capa
 binary, and repeat `setcap` after replacing it. ICMP is commonly filtered or rate-limited and can
 have worse latency than UDP; this mode is a fallback, not the default. It currently supports Linux
 and IPv4 only, so use an IPv4 target address. The normal QUIC transport remains unchanged and is
-selected by default on the client. A host listens on both carriers by default; use
-`--transport quic` or `--transport icmp` on the host to isolate one carrier during testing.
+selected with `--transport quic` (the default).
 
 ## Build
 

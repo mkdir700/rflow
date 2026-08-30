@@ -39,7 +39,7 @@ const PAIRING_REQUEST_LIFETIME: Duration = Duration::from_secs(120);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConfig {
     pub bind: SocketAddr,
-    pub transport: transport::HostTransportMode,
+    pub transport: transport::TransportMode,
     pub cert: PathBuf,
     pub key: PathBuf,
     pub size: Option<ScreenSize>,
@@ -764,12 +764,11 @@ async fn run_host(
     events
         .send(AppEvent::TopologyChanged(topology.clone()))
         .await;
-    let endpoints = transport::pairing_server_endpoints(config.bind, &identity, config.transport)?;
+    let endpoint =
+        transport::pairing_server_endpoint_with_mode(config.bind, &identity, config.transport)?;
     let mut trust = TrustStore::load(&config.trust_store)?;
     let mut pairing_rate_limiter = PairingRateLimiter::default();
-    for (mode, endpoint) in &endpoints {
-        tracing::info!(local = %endpoint.local_addr()?, transport = ?mode, "host listening");
-    }
+    tracing::info!(local = %endpoint.local_addr()?, "host listening");
     publish_status(&events, RuntimeStatus::Listening).await;
     let local_screen = topology
         .screens
@@ -790,7 +789,7 @@ async fn run_host(
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
-            accepted = accept_host_connection(&endpoints) => {
+            accepted = transport::accept_one(&endpoint) => {
                 let connection = accepted?;
                 let remote = connection.remote_address();
                 let Some(authorized_peer) = authorize_host_peer(
@@ -1098,19 +1097,6 @@ async fn mark_peer_offline(device_id: DeviceId, events: &AppEventBus) {
     match result {
         Ok(topology) => events.send(AppEvent::TopologyChanged(topology)).await,
         Err(error) => events.send(AppEvent::Faulted(classify_fault(&error))).await,
-    }
-}
-
-async fn accept_host_connection(
-    endpoints: &[(transport::TransportMode, Endpoint)],
-) -> Result<Connection> {
-    match endpoints {
-        [(_, endpoint)] => transport::accept_one(endpoint).await,
-        [(_, first), (_, second)] => tokio::select! {
-            connection = transport::accept_one(first) => connection,
-            connection = transport::accept_one(second) => connection,
-        },
-        _ => bail!("host requires one or two transport endpoints"),
     }
 }
 
@@ -2354,7 +2340,7 @@ mod tests {
         let mut runtime = RuntimeHandle::spawn(Arc::new(NoopDiagnostics)).unwrap();
         runtime
             .send(AppCommand::StartHost(HostConfig {
-                transport: transport::HostTransportMode::Quic,
+                transport: transport::TransportMode::Quic,
                 bind: "127.0.0.1:0".parse().unwrap(),
                 cert: PathBuf::from("missing-cert"),
                 key: PathBuf::from("missing-key"),
@@ -2409,7 +2395,7 @@ mod tests {
         let mut runtime = RuntimeHandle::spawn(Arc::new(NoopDiagnostics)).unwrap();
         runtime
             .send(AppCommand::StartHost(HostConfig {
-                transport: transport::HostTransportMode::Quic,
+                transport: transport::TransportMode::Quic,
                 bind: "127.0.0.1:0".parse().unwrap(),
                 cert,
                 key,
@@ -2458,7 +2444,7 @@ mod tests {
             transport::pairing_client_endpoint("0.0.0.0:0".parse().unwrap(), &client_identity)
                 .unwrap();
         let server_config = HostConfig {
-            transport: transport::HostTransportMode::Quic,
+            transport: transport::TransportMode::Quic,
             bind: "127.0.0.1:0".parse().unwrap(),
             cert: server_identity.certificate,
             key: server_identity.private_key,

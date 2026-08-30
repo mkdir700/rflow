@@ -57,9 +57,9 @@ enum Command {
     Host {
         #[arg(long, default_value = "0.0.0.0:24801")]
         bind: SocketAddr,
-        /// Accepted network carriers; defaults to listening on both.
-        #[arg(long, value_enum, default_value_t = transport::HostTransportMode::Both)]
-        transport: transport::HostTransportMode,
+        /// Network carrier for QUIC packets.
+        #[arg(long, value_enum, default_value_t = transport::TransportMode::Quic)]
+        transport: transport::TransportMode,
         #[arg(long = "identity-cert", requires = "key")]
         cert: Option<PathBuf>,
         #[arg(long = "identity-key", requires = "cert")]
@@ -78,7 +78,7 @@ enum Command {
     Client {
         /// Host IP address or hostname, with optional port.
         target: ServerTarget,
-        /// Network carrier for QUIC packets; the host must accept it.
+        /// Network carrier for QUIC packets; must match the host.
         #[arg(long, value_enum, default_value_t = transport::TransportMode::Quic)]
         transport: transport::TransportMode,
         #[arg(long = "identity-cert", requires = "identity_key")]

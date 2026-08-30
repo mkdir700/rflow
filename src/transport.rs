@@ -27,16 +27,6 @@ pub enum TransportMode {
     Icmp,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum HostTransportMode {
-    /// Listen on native QUIC/UDP and ICMP simultaneously.
-    Both,
-    /// Listen on native QUIC/UDP only.
-    Quic,
-    /// Listen on ICMP only.
-    Icmp,
-}
-
 #[derive(Debug)]
 struct PairingServerVerifier {
     provider: Arc<CryptoProvider>,
@@ -218,25 +208,6 @@ pub fn pairing_server_endpoint_with_mode(
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(transport_config()?);
     server_with_mode(config, bind, mode)
-}
-
-pub fn pairing_server_endpoints(
-    bind: SocketAddr,
-    identity: &IdentityPaths,
-    mode: HostTransportMode,
-) -> Result<Vec<(TransportMode, Endpoint)>> {
-    let modes: &[TransportMode] = match mode {
-        HostTransportMode::Both => &[TransportMode::Quic, TransportMode::Icmp],
-        HostTransportMode::Quic => &[TransportMode::Quic],
-        HostTransportMode::Icmp => &[TransportMode::Icmp],
-    };
-    modes
-        .iter()
-        .copied()
-        .map(|mode| {
-            pairing_server_endpoint_with_mode(bind, identity, mode).map(|endpoint| (mode, endpoint))
-        })
-        .collect()
 }
 
 pub fn pairing_client_endpoint(bind: SocketAddr, identity: &IdentityPaths) -> Result<Endpoint> {
