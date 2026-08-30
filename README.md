@@ -43,6 +43,28 @@ selected by default on the client. A host listens on both carriers by default; u
 When the default dual mode cannot open a raw ICMP socket, the host logs a warning and continues
 with QUIC only. Explicit `--transport icmp` remains strict and reports the permission error.
 
+During development, build first, grant the capability to that exact binary, and then run it
+directly:
+
+```bash
+cargo build
+sudo setcap cap_net_raw=ep target/debug/rflow
+getcap target/debug/rflow
+target/debug/rflow host -v --transport icmp
+```
+
+Do not run `cargo run` after `setcap`: when Cargo recompiles or relinks `target/debug/rflow`, Linux
+file capabilities are lost. After changing the code, repeat the build-and-`setcap` sequence. For a
+stable installation, grant the capability to the installed release binary:
+
+```bash
+cargo build --release
+sudo install -m 0755 target/release/rflow /usr/local/bin/rflow
+sudo setcap cap_net_raw=ep /usr/local/bin/rflow
+getcap /usr/local/bin/rflow
+/usr/local/bin/rflow host -v --transport icmp
+```
+
 ## Build
 
 ```bash
