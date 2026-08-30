@@ -101,11 +101,49 @@ pub enum TopologyRoute {
     },
 }
 
+const EDGE_BARRIER_DISTANCE: i32 = 4;
+
+struct EdgeBarrier<K> {
+    edge: Option<K>,
+    distance: i32,
+}
+
+impl<K: Copy + Eq> EdgeBarrier<K> {
+    fn push(&mut self, edge: K, distance: i32) -> bool {
+        if self.edge != Some(edge) {
+            self.edge = Some(edge);
+            self.distance = 0;
+        }
+        self.distance = self.distance.saturating_add(distance.max(0));
+        if self.distance >= EDGE_BARRIER_DISTANCE {
+            self.reset();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reset(&mut self) {
+        self.edge = None;
+        self.distance = 0;
+    }
+}
+
+impl<K> Default for EdgeBarrier<K> {
+    fn default() -> Self {
+        Self {
+            edge: None,
+            distance: 0,
+        }
+    }
+}
+
 pub struct TopologyRouter<'a> {
     topology: &'a ScreenTopology,
     active: ScreenId,
     x: i32,
     y: i32,
+    barrier: EdgeBarrier<Edge>,
 }
 
 impl<'a> TopologyRouter<'a> {
@@ -127,6 +165,7 @@ impl<'a> TopologyRouter<'a> {
             active,
             x: x.clamp(0, size.width - 1),
             y: y.clamp(0, size.height - 1),
+            barrier: EdgeBarrier::default(),
         })
     }
 
@@ -139,19 +178,34 @@ impl<'a> TopologyRouter<'a> {
         let next_x = self.x.saturating_add(dx);
         let next_y = self.y.saturating_add(dy);
         let crossed = if self.x == 0 && dx < 0 {
-            Some((Edge::Left, next_x, next_y))
+            Some(Edge::Left)
         } else if self.x == size.width - 1 && dx > 0 {
-            Some((Edge::Right, next_x - (size.width - 1), next_y))
+            Some(Edge::Right)
         } else if self.y == 0 && dy < 0 {
-            Some((Edge::Top, next_x, next_y))
+            Some(Edge::Top)
         } else if self.y == size.height - 1 && dy > 0 {
-            Some((Edge::Bottom, next_x, next_y - (size.height - 1)))
+            Some(Edge::Bottom)
         } else {
             None
         };
-        if let Some((edge, overflow_x, overflow_y)) = crossed
+        if let Some(edge) = crossed
             && let Some(target) = self.linked_edge(edge).cloned()
         {
+            let outward = match edge {
+                Edge::Left => dx.saturating_abs(),
+                Edge::Right => dx,
+                Edge::Top => dy.saturating_abs(),
+                Edge::Bottom => dy,
+            };
+            if !self.barrier.push(edge, outward) {
+                self.x = next_x.clamp(0, size.width - 1);
+                self.y = next_y.clamp(0, size.height - 1);
+                return TopologyRoute::Stay {
+                    screen_id: self.active.clone(),
+                    dx,
+                    dy,
+                };
+            }
             let target_size = self.screen_size(&target.screen_id);
             let (x, y) = match edge {
                 Edge::Left => (
@@ -163,7 +217,7 @@ impl<'a> TopologyRouter<'a> {
                     ),
                 ),
                 Edge::Right => (
-                    overflow_x.clamp(0, target_size.width - 1),
+                    1.min(target_size.width - 1),
                     scale_axis(
                         next_y.clamp(0, size.height - 1),
                         size.height,
@@ -184,7 +238,7 @@ impl<'a> TopologyRouter<'a> {
                         size.width,
                         target_size.width,
                     ),
-                    overflow_y.clamp(0, target_size.height - 1),
+                    1.min(target_size.height - 1),
                 ),
             };
             self.active = target.screen_id;
@@ -196,6 +250,7 @@ impl<'a> TopologyRouter<'a> {
                 y,
             };
         }
+        self.barrier.reset();
         self.x = next_x.clamp(0, size.width - 1);
         self.y = next_y.clamp(0, size.height - 1);
         TopologyRoute::Stay {
@@ -362,6 +417,7 @@ pub(crate) struct CursorRouter {
     active: ActiveScreen,
     x: i32,
     y: i32,
+    barrier: EdgeBarrier<ScreenDirection>,
 }
 
 impl CursorRouter {
@@ -378,6 +434,7 @@ impl CursorRouter {
             active: ActiveScreen::Local,
             x: local.width / 2,
             y: local.height / 2,
+            barrier: EdgeBarrier::default(),
         }
     }
 
@@ -390,6 +447,7 @@ impl CursorRouter {
         self.active = ActiveScreen::Local;
         self.x = x.clamp(0, self.local.width - 1);
         self.y = y.clamp(0, self.local.height - 1);
+        self.barrier.reset();
     }
 
     pub(crate) fn route_motion(&mut self, dx: i32, dy: i32) -> Route {
@@ -402,11 +460,15 @@ impl CursorRouter {
     fn route_local(&mut self, dx: i32, dy: i32) -> Route {
         let next_x = self.x.saturating_add(dx);
         let next_y = self.y.saturating_add(dy);
+        let outward = outward_distance(self.direction, self.x, self.y, self.local, dx, dy, false);
+        let can_cross = outward.is_some_and(|distance| self.barrier.push(self.direction, distance));
+        if outward.is_none() {
+            self.barrier.reset();
+        }
         match self.direction {
-            ScreenDirection::Right if self.x == self.local.width - 1 && dx > 0 => {
-                let overflow = next_x - (self.local.width - 1);
+            ScreenDirection::Right if can_cross => {
                 self.active = ActiveScreen::Remote;
-                self.x = overflow.clamp(0, self.remote.width - 1);
+                self.x = 1.min(self.remote.width - 1);
                 self.y = scale_axis(
                     next_y.clamp(0, self.local.height - 1),
                     self.local.height,
@@ -417,7 +479,7 @@ impl CursorRouter {
                     y: self.y,
                 }
             }
-            ScreenDirection::Left if self.x == 0 && dx < 0 => {
+            ScreenDirection::Left if can_cross => {
                 self.active = ActiveScreen::Remote;
                 self.x = self.remote.width.saturating_sub(2);
                 self.y = scale_axis(
@@ -430,7 +492,7 @@ impl CursorRouter {
                     y: self.y,
                 }
             }
-            ScreenDirection::Top if self.y == 0 && dy < 0 => {
+            ScreenDirection::Top if can_cross => {
                 self.active = ActiveScreen::Remote;
                 self.x = scale_axis(
                     next_x.clamp(0, self.local.width - 1),
@@ -443,9 +505,7 @@ impl CursorRouter {
                     y: self.y,
                 }
             }
-            ScreenDirection::TopRight
-                if self.x == self.local.width - 1 && dx > 0 && self.y == 0 && dy < 0 =>
-            {
+            ScreenDirection::TopRight if can_cross => {
                 self.active = ActiveScreen::Remote;
                 self.x = 1.min(self.remote.width - 1);
                 self.y = self.remote.height.saturating_sub(2);
@@ -454,7 +514,7 @@ impl CursorRouter {
                     y: self.y,
                 }
             }
-            ScreenDirection::Bottom if self.y == self.local.height - 1 && dy > 0 => {
+            ScreenDirection::Bottom if can_cross => {
                 self.active = ActiveScreen::Remote;
                 self.x = scale_axis(
                     next_x.clamp(0, self.local.width - 1),
@@ -467,12 +527,7 @@ impl CursorRouter {
                     y: self.y,
                 }
             }
-            ScreenDirection::BottomRight
-                if self.x == self.local.width - 1
-                    && dx > 0
-                    && self.y == self.local.height - 1
-                    && dy > 0 =>
-            {
+            ScreenDirection::BottomRight if can_cross => {
                 self.active = ActiveScreen::Remote;
                 self.x = 1.min(self.remote.width - 1);
                 self.y = 1.min(self.remote.height - 1);
@@ -481,9 +536,7 @@ impl CursorRouter {
                     y: self.y,
                 }
             }
-            ScreenDirection::BottomLeft
-                if self.x == 0 && dx < 0 && self.y == self.local.height - 1 && dy > 0 =>
-            {
+            ScreenDirection::BottomLeft if can_cross => {
                 self.active = ActiveScreen::Remote;
                 self.x = self.remote.width.saturating_sub(2);
                 self.y = 1.min(self.remote.height - 1);
@@ -492,7 +545,7 @@ impl CursorRouter {
                     y: self.y,
                 }
             }
-            ScreenDirection::TopLeft if self.x == 0 && dx < 0 && self.y == 0 && dy < 0 => {
+            ScreenDirection::TopLeft if can_cross => {
                 self.active = ActiveScreen::Remote;
                 self.x = self.remote.width.saturating_sub(2);
                 self.y = self.remote.height.saturating_sub(2);
@@ -512,8 +565,13 @@ impl CursorRouter {
     fn route_remote(&mut self, dx: i32, dy: i32) -> Route {
         let next_x = self.x.saturating_add(dx);
         let next_y = self.y.saturating_add(dy);
+        let outward = outward_distance(self.direction, self.x, self.y, self.remote, dx, dy, true);
+        let can_cross = outward.is_some_and(|distance| self.barrier.push(self.direction, distance));
+        if outward.is_none() {
+            self.barrier.reset();
+        }
         match self.direction {
-            ScreenDirection::Right if self.x == 0 && dx < 0 => {
+            ScreenDirection::Right if can_cross => {
                 self.active = ActiveScreen::Local;
                 self.x = self.local.width.saturating_sub(2);
                 self.y = scale_axis(
@@ -526,7 +584,7 @@ impl CursorRouter {
                     y: self.y,
                 }
             }
-            ScreenDirection::Left if self.x == self.remote.width - 1 && dx > 0 => {
+            ScreenDirection::Left if can_cross => {
                 self.active = ActiveScreen::Local;
                 self.x = 1.min(self.local.width - 1);
                 self.y = scale_axis(
@@ -539,7 +597,7 @@ impl CursorRouter {
                     y: self.y,
                 }
             }
-            ScreenDirection::Top if self.y == self.remote.height - 1 && dy > 0 => {
+            ScreenDirection::Top if can_cross => {
                 self.active = ActiveScreen::Local;
                 self.x = scale_axis(
                     next_x.clamp(0, self.remote.width - 1),
@@ -552,9 +610,7 @@ impl CursorRouter {
                     y: self.y,
                 }
             }
-            ScreenDirection::TopRight
-                if self.x == 0 && dx < 0 && self.y == self.remote.height - 1 && dy > 0 =>
-            {
+            ScreenDirection::TopRight if can_cross => {
                 self.active = ActiveScreen::Local;
                 self.x = self.local.width.saturating_sub(2);
                 self.y = 1.min(self.local.height - 1);
@@ -563,7 +619,7 @@ impl CursorRouter {
                     y: self.y,
                 }
             }
-            ScreenDirection::Bottom if self.y == 0 && dy < 0 => {
+            ScreenDirection::Bottom if can_cross => {
                 self.active = ActiveScreen::Local;
                 self.x = scale_axis(
                     next_x.clamp(0, self.remote.width - 1),
@@ -576,7 +632,7 @@ impl CursorRouter {
                     y: self.y,
                 }
             }
-            ScreenDirection::BottomRight if self.x == 0 && dx < 0 && self.y == 0 && dy < 0 => {
+            ScreenDirection::BottomRight if can_cross => {
                 self.active = ActiveScreen::Local;
                 self.x = self.local.width.saturating_sub(2);
                 self.y = self.local.height.saturating_sub(2);
@@ -585,9 +641,7 @@ impl CursorRouter {
                     y: self.y,
                 }
             }
-            ScreenDirection::BottomLeft
-                if self.x == self.remote.width - 1 && dx > 0 && self.y == 0 && dy < 0 =>
-            {
+            ScreenDirection::BottomLeft if can_cross => {
                 self.active = ActiveScreen::Local;
                 self.x = 1.min(self.local.width - 1);
                 self.y = self.local.height.saturating_sub(2);
@@ -596,12 +650,7 @@ impl CursorRouter {
                     y: self.y,
                 }
             }
-            ScreenDirection::TopLeft
-                if self.x == self.remote.width - 1
-                    && dx > 0
-                    && self.y == self.remote.height - 1
-                    && dy > 0 =>
-            {
+            ScreenDirection::TopLeft if can_cross => {
                 self.active = ActiveScreen::Local;
                 self.x = 1.min(self.local.width - 1);
                 self.y = 1.min(self.local.height - 1);
@@ -616,6 +665,58 @@ impl CursorRouter {
                 Route::Remote { dx, dy }
             }
         }
+    }
+}
+
+fn outward_distance(
+    direction: ScreenDirection,
+    x: i32,
+    y: i32,
+    size: ScreenSize,
+    dx: i32,
+    dy: i32,
+    returning: bool,
+) -> Option<i32> {
+    let left = x == 0 && dx < 0;
+    let right = x == size.width - 1 && dx > 0;
+    let top = y == 0 && dy < 0;
+    let bottom = y == size.height - 1 && dy > 0;
+    let horizontal = |positive: bool| if positive { dx } else { dx.saturating_abs() };
+    let vertical = |positive: bool| if positive { dy } else { dy.saturating_abs() };
+    match (direction, returning) {
+        (ScreenDirection::Right, false) if right => Some(horizontal(true)),
+        (ScreenDirection::Right, true) if left => Some(horizontal(false)),
+        (ScreenDirection::Left, false) if left => Some(horizontal(false)),
+        (ScreenDirection::Left, true) if right => Some(horizontal(true)),
+        (ScreenDirection::Top, false) if top => Some(vertical(false)),
+        (ScreenDirection::Top, true) if bottom => Some(vertical(true)),
+        (ScreenDirection::Bottom, false) if bottom => Some(vertical(true)),
+        (ScreenDirection::Bottom, true) if top => Some(vertical(false)),
+        (ScreenDirection::TopRight, false) if right && top => {
+            Some(horizontal(true).min(vertical(false)))
+        }
+        (ScreenDirection::TopRight, true) if left && bottom => {
+            Some(horizontal(false).min(vertical(true)))
+        }
+        (ScreenDirection::BottomRight, false) if right && bottom => {
+            Some(horizontal(true).min(vertical(true)))
+        }
+        (ScreenDirection::BottomRight, true) if left && top => {
+            Some(horizontal(false).min(vertical(false)))
+        }
+        (ScreenDirection::BottomLeft, false) if left && bottom => {
+            Some(horizontal(false).min(vertical(true)))
+        }
+        (ScreenDirection::BottomLeft, true) if right && top => {
+            Some(horizontal(true).min(vertical(false)))
+        }
+        (ScreenDirection::TopLeft, false) if left && top => {
+            Some(horizontal(false).min(vertical(false)))
+        }
+        (ScreenDirection::TopLeft, true) if right && bottom => {
+            Some(horizontal(true).min(vertical(true)))
+        }
+        _ => None,
     }
 }
 
@@ -654,7 +755,7 @@ mod tests {
 
         assert_eq!(router.route_motion(5, 0), Route::Local { dx: 5, dy: 0 });
         assert_eq!(
-            router.route_motion(1, 0),
+            router.route_motion(4, 0),
             Route::EnterRemote { x: 1, y: 720 }
         );
         assert_eq!(router.active(), ActiveScreen::Remote);
@@ -668,7 +769,47 @@ mod tests {
         assert_eq!(router.route_motion(5, 0), Route::Local { dx: 5, dy: 0 });
         assert_eq!(router.active(), ActiveScreen::Local);
         assert_eq!(
-            router.route_motion(1, 0),
+            router.route_motion(4, 0),
+            Route::EnterRemote { x: 1, y: 720 }
+        );
+    }
+
+    #[test]
+    fn edge_barrier_uses_distance_instead_of_mouse_event_count() {
+        let mut high_report_rate = router();
+        let mut low_report_rate = router();
+        for router in [&mut high_report_rate, &mut low_report_rate] {
+            router.set_local_position(1918, 540);
+            assert_eq!(router.route_motion(5, 0), Route::Local { dx: 5, dy: 0 });
+        }
+
+        for _ in 0..3 {
+            assert_eq!(
+                high_report_rate.route_motion(1, 0),
+                Route::Local { dx: 1, dy: 0 }
+            );
+        }
+        assert_eq!(
+            high_report_rate.route_motion(1, 0),
+            Route::EnterRemote { x: 1, y: 720 }
+        );
+        assert_eq!(
+            low_report_rate.route_motion(4, 0),
+            Route::EnterRemote { x: 1, y: 720 }
+        );
+    }
+
+    #[test]
+    fn moving_inward_resets_accumulated_edge_resistance() {
+        let mut router = router();
+        router.set_local_position(1919, 540);
+
+        assert_eq!(router.route_motion(2, 0), Route::Local { dx: 2, dy: 0 });
+        assert_eq!(router.route_motion(-1, 0), Route::Local { dx: -1, dy: 0 });
+        assert_eq!(router.route_motion(1, 0), Route::Local { dx: 1, dy: 0 });
+        assert_eq!(router.route_motion(2, 0), Route::Local { dx: 2, dy: 0 });
+        assert_eq!(
+            router.route_motion(2, 0),
             Route::EnterRemote { x: 1, y: 720 }
         );
     }
@@ -684,11 +825,11 @@ mod tests {
 
         assert_eq!(router.route_motion(-3, 0), Route::Local { dx: -3, dy: 0 });
         assert_eq!(
-            router.route_motion(-1, 0),
+            router.route_motion(-4, 0),
             Route::EnterRemote { x: 198, y: 50 }
         );
         assert_eq!(router.route_motion(3, 0), Route::Remote { dx: 3, dy: 0 });
-        assert_eq!(router.route_motion(1, 0), Route::EnterLocal { x: 1, y: 25 });
+        assert_eq!(router.route_motion(4, 0), Route::EnterLocal { x: 1, y: 25 });
     }
 
     #[test]
@@ -702,11 +843,11 @@ mod tests {
 
         assert_eq!(router.route_motion(0, -3), Route::Local { dx: 0, dy: -3 });
         assert_eq!(
-            router.route_motion(0, -1),
+            router.route_motion(0, -4),
             Route::EnterRemote { x: 50, y: 198 }
         );
         assert_eq!(router.route_motion(0, 3), Route::Remote { dx: 0, dy: 3 });
-        assert_eq!(router.route_motion(0, 1), Route::EnterLocal { x: 25, y: 1 });
+        assert_eq!(router.route_motion(0, 4), Route::EnterLocal { x: 25, y: 1 });
     }
 
     #[test]
@@ -721,12 +862,12 @@ mod tests {
         assert_eq!(router.route_motion(3, 0), Route::Local { dx: 3, dy: 0 });
         assert_eq!(router.route_motion(3, -3), Route::Local { dx: 3, dy: -3 });
         assert_eq!(
-            router.route_motion(1, -1),
+            router.route_motion(4, -4),
             Route::EnterRemote { x: 1, y: 198 }
         );
         assert_eq!(router.route_motion(-3, 3), Route::Remote { dx: -3, dy: 3 });
         assert_eq!(
-            router.route_motion(-1, 1),
+            router.route_motion(-4, 4),
             Route::EnterLocal { x: 98, y: 1 }
         );
     }
@@ -782,7 +923,7 @@ mod tests {
                 }
             );
             assert_eq!(
-                router.route_motion(outbound.0.signum(), outbound.1.signum()),
+                router.route_motion(outbound.0.signum() * 4, outbound.1.signum() * 4),
                 entered
             );
             assert_eq!(
@@ -793,7 +934,7 @@ mod tests {
                 }
             );
             assert_eq!(
-                router.route_motion(inbound.0.signum(), inbound.1.signum()),
+                router.route_motion(inbound.0.signum() * 4, inbound.1.signum() * 4),
                 returned
             );
         }
@@ -804,11 +945,11 @@ mod tests {
         let mut router = router();
         router.set_local_position(1918, 540);
         router.route_motion(5, 0);
-        router.route_motion(1, 0);
+        router.route_motion(4, 0);
 
         assert_eq!(router.route_motion(-5, 0), Route::Remote { dx: -5, dy: 0 });
         assert_eq!(
-            router.route_motion(-1, 0),
+            router.route_motion(-4, 0),
             Route::EnterLocal { x: 1918, y: 540 }
         );
         assert_eq!(router.active(), ActiveScreen::Local);
@@ -820,7 +961,7 @@ mod tests {
         assert_eq!(router.route_motion(10, -4), Route::Local { dx: 10, dy: -4 });
         router.set_local_position(1918, 540);
         router.route_motion(5, 0);
-        router.route_motion(1, 0);
+        router.route_motion(4, 0);
         assert_eq!(router.route_motion(8, 3), Route::Remote { dx: 8, dy: 3 });
     }
 
@@ -947,14 +1088,14 @@ mod tests {
             TopologyRoute::Stay { .. }
         ));
         assert!(
-            matches!(router.route_motion(1, 0), TopologyRoute::Cross { screen_id: ScreenId(ref id), .. } if id == "b")
+            matches!(router.route_motion(4, 0), TopologyRoute::Cross { screen_id: ScreenId(ref id), .. } if id == "b")
         );
         assert!(matches!(
             router.route_motion(100, 0),
             TopologyRoute::Stay { .. }
         ));
         assert!(
-            matches!(router.route_motion(1, 0), TopologyRoute::Cross { screen_id: ScreenId(ref id), .. } if id == "c")
+            matches!(router.route_motion(4, 0), TopologyRoute::Cross { screen_id: ScreenId(ref id), .. } if id == "c")
         );
         assert_eq!(router.active_screen(), &ScreenId("c".into()));
     }
