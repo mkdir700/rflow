@@ -153,12 +153,14 @@ struct CaptureContext {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum NativeCapturedEvent {
     Input {
+        source: usize,
         sequence: u64,
         event_type: u16,
         code: u16,
         value: i32,
     },
     Motion {
+        source: usize,
         sequence: u64,
         timestamp_micros: u64,
         dx: i32,
@@ -335,6 +337,7 @@ fn handle_captured_event(context: &CaptureContext, event_type: u32, event: CGEve
                     .unwrap_or_default()
                     .as_micros() as u64;
                 (context.callback)(NativeCapturedEvent::Motion {
+                    source: 0,
                     sequence,
                     timestamp_micros,
                     dx,
@@ -419,6 +422,7 @@ fn send_key(context: &CaptureContext, code: u16, value: i32) {
 
 fn send_reliable(context: &CaptureContext, event_type: u16, code: u16, value: i32) {
     let event = NativeCapturedEvent::Input {
+        source: 0,
         sequence: next_sequence(context),
         event_type,
         code,
@@ -434,7 +438,7 @@ pub struct Injector {
 }
 
 impl Injector {
-    pub fn new() -> Result<Self> {
+    pub fn new(_paths: &[PathBuf]) -> Result<Self> {
         if !unsafe { AXIsProcessTrusted() } {
             tracing::warn!(
                 "macOS does not report this process as Accessibility-trusted; input injection may be ignored"
@@ -443,7 +447,7 @@ impl Injector {
         Ok(Self::default())
     }
 
-    pub fn emit_motion(&mut self, dx: i32, dy: i32) -> Result<()> {
+    pub fn emit_motion(&mut self, _source: usize, dx: i32, dy: i32) -> Result<()> {
         let position = self.pointer_position()?;
         let (event_type, button) = drag_event(&self.mouse_buttons);
         self.post_mouse(
@@ -477,7 +481,13 @@ impl Injector {
         )
     }
 
-    pub fn emit_raw(&mut self, event_type: u16, code: u16, value: i32) -> Result<()> {
+    pub fn emit_raw(
+        &mut self,
+        _source: usize,
+        event_type: u16,
+        code: u16,
+        value: i32,
+    ) -> Result<()> {
         match event_type {
             EV_KEY => self.emit_key(code, value),
             EV_REL if code == REL_WHEEL => self.emit_scroll(value, 0),

@@ -13,7 +13,8 @@ use std::{
 use crate::{core::ScreenSize, platform::DetectedScreen};
 use anyhow::{Context, Result, bail};
 use evdev::{
-    AttributeSet, Device, EventType, InputEvent, KeyCode, RelativeAxisCode, uinput::VirtualDevice,
+    AttributeSet, AttributeSetRef, Device, EventType, InputEvent, KeyCode, RelativeAxisCode,
+    uinput::VirtualDevice,
 };
 use serde::Deserialize;
 
@@ -25,12 +26,14 @@ pub const REL_Y: u16 = 0x01;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum NativeCapturedEvent {
     Input {
+        source: usize,
         sequence: u64,
         event_type: u16,
         code: u16,
         value: i32,
     },
     Motion {
+        source: usize,
         sequence: u64,
         timestamp_micros: u64,
         dx: i32,
@@ -317,13 +320,16 @@ pub fn spawn_capture(
     let (ready_tx, ready_rx) = std_mpsc::channel();
     let handles: Vec<std::thread::JoinHandle<()>> = paths
         .into_iter()
-        .map(|path| {
+        .enumerate()
+        .map(|(source, path)| {
             let callback = callback.clone();
             let sequence = sequence.clone();
             let ready = ready_tx.clone();
             let stop = stop.clone();
             std::thread::spawn(move || {
-                if let Err(error) = capture_device(&path, grab, callback, sequence, &ready, &stop) {
+                if let Err(error) =
+                    capture_device(source, &path, grab, callback, sequence, &ready, &stop)
+                {
                     let _ = ready.send(Err(format!("{error:#}")));
                     tracing::error!(device = %path.display(), %error, "input capture stopped");
                 }
@@ -356,6 +362,7 @@ pub fn spawn_capture(
 }
 
 fn capture_device(
+    source: usize,
     path: &PathBuf,
     grab: bool,
     callback: CaptureCallback,
@@ -397,6 +404,7 @@ fn capture_device(
             } else if event_type == EV_KEY || event_type == EV_REL {
                 let sequence = sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                 callback(NativeCapturedEvent::Input {
+                    source,
                     sequence,
                     event_type,
                     code,
@@ -411,6 +419,7 @@ fn capture_device(
                 .unwrap_or_default()
                 .as_micros() as u64;
             callback(NativeCapturedEvent::Motion {
+                source,
                 sequence,
                 timestamp_micros,
                 dx,
@@ -422,30 +431,53 @@ fn capture_device(
 }
 
 pub struct Injector {
-    device: VirtualDevice,
+    devices: Vec<VirtualDevice>,
+    pointer_source: usize,
 }
 
 impl Injector {
-    pub fn new() -> Result<Self> {
-        let mut keys = AttributeSet::<KeyCode>::new();
-        for code in 0..=0x2ff {
-            keys.insert(KeyCode(code));
+    pub fn new(paths: &[PathBuf]) -> Result<Self> {
+        if paths.is_empty() {
+            return Ok(Self {
+                devices: vec![generic_remote_device()?],
+                pointer_source: 0,
+            });
         }
-        let mut axes = AttributeSet::<RelativeAxisCode>::new();
-        for code in 0..=0x0c {
-            axes.insert(RelativeAxisCode(code));
+        let mut devices = Vec::with_capacity(paths.len());
+        let mut pointer_source = None;
+        for (source_index, path) in paths.iter().enumerate() {
+            let source = Device::open(path)
+                .with_context(|| format!("inspect input device {}", path.display()))?;
+            let name = source.name().unwrap_or("rflow input");
+            let mut builder = VirtualDevice::builder()
+                .context("open /dev/uinput")?
+                .name(name);
+            if let Some(keys) = source.supported_keys() {
+                builder = builder.with_keys(keys)?;
+            }
+            if let Some(source_axes) = source.supported_relative_axes() {
+                let axes = forwarded_relative_axes(source_axes);
+                if axes.contains(RelativeAxisCode::REL_X)
+                    && axes.contains(RelativeAxisCode::REL_Y)
+                    && pointer_source.is_none()
+                {
+                    pointer_source = Some(source_index);
+                }
+                builder = builder.with_relative_axes(&axes)?;
+            }
+            devices.push(
+                builder
+                    .build()
+                    .with_context(|| format!("create virtual clone of {name}"))?,
+            );
         }
-        let device = VirtualDevice::builder()
-            .context("open /dev/uinput")?
-            .name("rflow virtual input")
-            .with_keys(&keys)?
-            .with_relative_axes(&axes)?
-            .build()
-            .context("create rflow virtual input device")?;
-        Ok(Self { device })
+        Ok(Self {
+            devices,
+            pointer_source: pointer_source.unwrap_or(0),
+        })
     }
 
-    pub fn emit_motion(&mut self, dx: i32, dy: i32) -> Result<()> {
+    pub fn emit_motion(&mut self, source: usize, dx: i32, dy: i32) -> Result<()> {
         let mut events = Vec::with_capacity(2);
         if dx != 0 {
             events.push(InputEvent::new(EV_REL, REL_X, dx));
@@ -454,7 +486,9 @@ impl Injector {
             events.push(InputEvent::new(EV_REL, REL_Y, dy));
         }
         if !events.is_empty() {
-            self.device.emit(&events).context("inject pointer motion")?;
+            self.device(source)?
+                .emit(&events)
+                .context("inject pointer motion")?;
         }
         Ok(())
     }
@@ -468,18 +502,67 @@ impl Injector {
         {
             return Ok(());
         }
-        self.emit_motion(-1_000_000, -1_000_000)?;
-        self.emit_motion(x.max(0), y.max(0))
+        self.emit_motion(self.pointer_source, -1_000_000, -1_000_000)?;
+        self.emit_motion(self.pointer_source, x.max(0), y.max(0))
     }
 
-    pub fn emit_raw(&mut self, event_type: u16, code: u16, value: i32) -> Result<()> {
+    pub fn emit_raw(
+        &mut self,
+        source: usize,
+        event_type: u16,
+        code: u16,
+        value: i32,
+    ) -> Result<()> {
         if event_type != EventType::KEY.0 && event_type != EventType::RELATIVE.0 {
             return Ok(());
         }
-        self.device
+        self.device(source)?
             .emit(&[InputEvent::new(event_type, code, value)])
             .context("inject input event")
     }
+
+    fn device(&mut self, source: usize) -> Result<&mut VirtualDevice> {
+        self.devices
+            .get_mut(source)
+            .with_context(|| format!("input source {source} has no virtual device"))
+    }
+}
+
+fn forwarded_relative_axes(
+    source: &AttributeSetRef<RelativeAxisCode>,
+) -> AttributeSet<RelativeAxisCode> {
+    source
+        .into_iter()
+        .filter(|axis| {
+            !matches!(
+                *axis,
+                RelativeAxisCode::REL_WHEEL_HI_RES | RelativeAxisCode::REL_HWHEEL_HI_RES
+            )
+        })
+        .collect()
+}
+
+fn generic_remote_device() -> Result<VirtualDevice> {
+    let mut keys = evdev::AttributeSet::<KeyCode>::new();
+    for code in 0..=0x2ff {
+        keys.insert(KeyCode(code));
+    }
+    let mut axes = evdev::AttributeSet::<RelativeAxisCode>::new();
+    for axis in [
+        RelativeAxisCode::REL_X,
+        RelativeAxisCode::REL_Y,
+        RelativeAxisCode::REL_WHEEL,
+        RelativeAxisCode::REL_HWHEEL,
+    ] {
+        axes.insert(axis);
+    }
+    VirtualDevice::builder()
+        .context("open /dev/uinput")?
+        .name("rflow remote input")
+        .with_keys(&keys)?
+        .with_relative_axes(&axes)?
+        .build()
+        .context("create rflow remote input device")
 }
 
 #[cfg(test)]
@@ -491,6 +574,27 @@ mod discovery_tests {
         assert!(is_virtual_input_name("rflow virtual keyboard"));
         assert!(is_virtual_input_name("Deskflow pointer"));
         assert!(!is_virtual_input_name("Logitech USB Receiver"));
+    }
+
+    #[test]
+    fn forwarded_axes_do_not_claim_high_resolution_scroll() {
+        let source: AttributeSet<RelativeAxisCode> = [
+            RelativeAxisCode::REL_X,
+            RelativeAxisCode::REL_Y,
+            RelativeAxisCode::REL_WHEEL,
+            RelativeAxisCode::REL_WHEEL_HI_RES,
+            RelativeAxisCode::REL_HWHEEL,
+            RelativeAxisCode::REL_HWHEEL_HI_RES,
+        ]
+        .into_iter()
+        .collect();
+
+        let forwarded = forwarded_relative_axes(&source);
+
+        assert!(forwarded.contains(RelativeAxisCode::REL_WHEEL));
+        assert!(forwarded.contains(RelativeAxisCode::REL_HWHEEL));
+        assert!(!forwarded.contains(RelativeAxisCode::REL_WHEEL_HI_RES));
+        assert!(!forwarded.contains(RelativeAxisCode::REL_HWHEEL_HI_RES));
     }
 
     #[test]

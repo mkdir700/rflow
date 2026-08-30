@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
@@ -15,8 +15,9 @@ use tokio::sync::{mpsc, watch};
 
 use crate::{
     core::{
-        ControlTarget, DesktopSession, Motion, ScreenDirection, ScreenId, ScreenNode, ScreenSize,
-        ScreenTopology, SessionEffect, SessionEvent, TopologyDeviceId,
+        ButtonState, ControlTarget, DesktopSession, HeldInput, InputEvent, Motion, ScreenDirection,
+        ScreenId, ScreenNode, ScreenSize, ScreenTopology, SessionEffect, SessionEvent,
+        TopologyDeviceId,
     },
     identity::IdentityPaths,
     pairing::{
@@ -924,11 +925,12 @@ async fn run_host_connection(
 
     let mut session = DesktopSession::host(local_size, remote_size, direction);
     events.try_send(AppEvent::ControlChanged(ControlTarget::Local));
-    let mut injector = InputInjector::new()?;
+    let mut injector = InputInjector::new(&devices)?;
     if let Some((x, y)) = platform::cursor_position() {
         session.set_local_position(x, y);
     }
     let mut capture = platform::capture(devices, true)?;
+    let mut held_sources = HashMap::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     let mut heartbeat_sequence = 0_u64;
     let mut reliable_sequence = 0_u64;
@@ -937,9 +939,20 @@ async fn run_host_connection(
         loop {
             tokio::select! {
                 captured = capture.next() => {
-                    let event = match captured? {
-                        CapturedEvent::Input { event, .. } => SessionEvent::PhysicalInput(event),
-                        CapturedEvent::Motion(motion) => SessionEvent::PhysicalMotion(motion),
+                    let (source, event, released) = match captured? {
+                        CapturedEvent::Input { source, event, .. } => {
+                            let held = held_input(event);
+                            if matches!(input_state(event), Some(ButtonState::Pressed))
+                                && let Some(held) = held
+                            {
+                                held_sources.insert(held, source);
+                            }
+                            (source, SessionEvent::PhysicalInput(event),
+                             matches!(input_state(event), Some(ButtonState::Released)).then_some(held).flatten())
+                        }
+                        CapturedEvent::Motion { source, motion } => {
+                            (source, SessionEvent::PhysicalMotion(motion), None)
+                        }
                     };
                     execute_host_effects(
                         session.handle(event),
@@ -948,7 +961,9 @@ async fn run_host_connection(
                         &mut injector,
                         &events,
                         &mut reliable_sequence,
+                        LocalInputSources { current: Some(source), held: &held_sources },
                     ).await?;
+                    if let Some(held) = released { held_sources.remove(&held); }
                 }
                 _ = heartbeat.tick() => {
                     heartbeat_sequence = heartbeat_sequence.wrapping_add(1);
@@ -972,6 +987,10 @@ async fn run_host_connection(
         &mut injector,
         &events,
         &mut reliable_sequence,
+        LocalInputSources {
+            current: None,
+            held: &held_sources,
+        },
     )
     .await;
     connection.close(0_u32.into(), b"host stopped");
@@ -986,11 +1005,17 @@ async fn execute_host_effects(
     local: &mut InputInjector,
     events: &AppEventBus,
     sequence: &mut u64,
+    sources: LocalInputSources<'_>,
 ) -> Result<()> {
     for effect in effects {
         match effect {
-            SessionEffect::InjectLocal(event) => local.emit(event)?,
-            SessionEffect::InjectLocalMotion { dx, dy } => local.emit_motion(dx, dy)?,
+            SessionEffect::InjectLocal(event) => {
+                let source = local_event_source(event, sources.current, sources.held);
+                local.emit(source, event)?;
+            }
+            SessionEffect::InjectLocalMotion { dx, dy } => {
+                local.emit_motion(sources.current.unwrap_or(0), dx, dy)?;
+            }
             SessionEffect::SendRemote(event) => {
                 *sequence = sequence.wrapping_add(1);
                 write_reliable(remote, &encode_input(*sequence, event)?).await?;
@@ -1013,6 +1038,38 @@ async fn execute_host_effects(
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct LocalInputSources<'a> {
+    current: Option<usize>,
+    held: &'a HashMap<HeldInput, usize>,
+}
+
+fn held_input(event: InputEvent) -> Option<HeldInput> {
+    match event {
+        InputEvent::Key { key, .. } => Some(HeldInput::Key(key)),
+        InputEvent::Button { button, .. } => Some(HeldInput::Button(button)),
+        InputEvent::Scroll { .. } => None,
+    }
+}
+
+fn input_state(event: InputEvent) -> Option<ButtonState> {
+    match event {
+        InputEvent::Key { state, .. } | InputEvent::Button { state, .. } => Some(state),
+        InputEvent::Scroll { .. } => None,
+    }
+}
+
+fn local_event_source(
+    event: InputEvent,
+    current_source: Option<usize>,
+    held_sources: &HashMap<HeldInput, usize>,
+) -> usize {
+    held_input(event)
+        .and_then(|held| held_sources.get(&held).copied())
+        .or(current_source)
+        .unwrap_or(0)
 }
 
 async fn run_client(
@@ -1286,7 +1343,7 @@ async fn run_client_connection(
     mut stop: watch::Receiver<bool>,
     diagnostics: Arc<dyn DiagnosticSink>,
 ) -> Result<()> {
-    let mut injector = InputInjector::new()?;
+    let mut injector = InputInjector::new(&[])?;
     let mut session = DesktopSession::client();
     let result: Result<()> = async {
         loop {
@@ -1346,8 +1403,8 @@ async fn run_client_connection(
 fn execute_client_effects(effects: Vec<SessionEffect>, injector: &mut InputInjector) -> Result<()> {
     for effect in effects {
         match effect {
-            SessionEffect::InjectLocal(event) => injector.emit(event)?,
-            SessionEffect::InjectLocalMotion { dx, dy } => injector.emit_motion(dx, dy)?,
+            SessionEffect::InjectLocal(event) => injector.emit(0, event)?,
+            SessionEffect::InjectLocalMotion { dx, dy } => injector.emit_motion(0, dx, dy)?,
             SessionEffect::SetLocalCursor { x, y } => injector.set_cursor_position(x, y)?,
             SessionEffect::SendRemote(_)
             | SessionEffect::SendRemoteMotion(_)
@@ -1782,6 +1839,18 @@ mod tests {
             classify_fault(&anyhow::anyhow!("grant Accessibility permission")).kind,
             FaultKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn held_input_keeps_its_physical_source_across_screen_transitions() {
+        let key = crate::core::Key(56);
+        let event = InputEvent::Key {
+            key,
+            state: ButtonState::Released,
+        };
+        let held_sources = HashMap::from([(HeldInput::Key(key), 3)]);
+
+        assert_eq!(local_event_source(event, Some(1), &held_sources), 3);
     }
 
     #[test]

@@ -30,12 +30,14 @@ const REL_WHEEL: u16 = 0x08;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum NativeCapturedEvent {
     Input {
+        source: usize,
         sequence: u64,
         event_type: u16,
         code: u16,
         value: i32,
     },
     Motion {
+        source: usize,
         sequence: u64,
         timestamp_micros: u64,
         dx: i32,
@@ -126,20 +128,26 @@ pub fn spawn_capture(
 pub struct Injector;
 
 impl Injector {
-    pub fn new() -> Result<Self> {
+    pub fn new(_paths: &[PathBuf]) -> Result<Self> {
         Ok(Self)
     }
 
-    pub fn emit_motion(&mut self, dx: i32, dy: i32) -> Result<()> {
+    pub fn emit_motion(&mut self, _source: usize, dx: i32, dy: i32) -> Result<()> {
         send_mouse(dx, dy, 0, MOUSEEVENTF_MOVE)
     }
 
     pub fn set_cursor_position(&mut self, x: i32, y: i32) -> Result<()> {
-        self.emit_motion(-1_000_000, -1_000_000)?;
-        self.emit_motion(x.max(0), y.max(0))
+        self.emit_motion(0, -1_000_000, -1_000_000)?;
+        self.emit_motion(0, x.max(0), y.max(0))
     }
 
-    pub fn emit_raw(&mut self, event_type: u16, code: u16, value: i32) -> Result<()> {
+    pub fn emit_raw(
+        &mut self,
+        _source: usize,
+        event_type: u16,
+        code: u16,
+        value: i32,
+    ) -> Result<()> {
         match event_type {
             EV_KEY => self.emit_key(code, value),
             EV_REL if code == REL_WHEEL => {

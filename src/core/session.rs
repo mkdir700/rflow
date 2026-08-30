@@ -9,7 +9,7 @@ pub enum ControlTarget {
     Remote,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HeldInput {
     Key(Key),
     Button(Button),

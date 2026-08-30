@@ -16,8 +16,15 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapturedEvent {
-    Input { sequence: u64, event: InputEvent },
-    Motion(Motion),
+    Input {
+        source: usize,
+        sequence: u64,
+        event: InputEvent,
+    },
+    Motion {
+        source: usize,
+        motion: Motion,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,7 +41,7 @@ pub struct DetectedScreen {
 /// Owns a platform capture session and hides its channel/protocol plumbing.
 pub struct InputCapture {
     reliable: mpsc::Receiver<CapturedEvent>,
-    motion: watch::Receiver<Option<Motion>>,
+    motion: watch::Receiver<Option<(usize, Motion)>>,
     stop: Arc<AtomicBool>,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
@@ -58,8 +65,8 @@ impl InputCapture {
                 }
                 changed = self.motion.changed() => {
                     changed.context("all pointer capture threads stopped")?;
-                    if let Some(motion) = *self.motion.borrow_and_update() {
-                        return Ok(CapturedEvent::Motion(motion));
+                    if let Some((source, motion)) = *self.motion.borrow_and_update() {
+                        return Ok(CapturedEvent::Motion { source, motion });
                     }
                 }
             }
@@ -81,28 +88,37 @@ pub fn capture(paths: Vec<PathBuf>, grab: bool) -> Result<InputCapture> {
     let stop = Arc::new(AtomicBool::new(false));
     let callback: input::CaptureCallback = Arc::new(move |captured| match captured {
         input::NativeCapturedEvent::Input {
+            source,
             sequence,
             event_type,
             code,
             value,
         } => match decode_native_input(event_type, code, value) {
             Ok(event) => {
-                let _ = reliable_tx.blocking_send(CapturedEvent::Input { sequence, event });
+                let _ = reliable_tx.blocking_send(CapturedEvent::Input {
+                    source,
+                    sequence,
+                    event,
+                });
             }
             Err(error) => tracing::debug!(%error, event_type, code, "ignore native input"),
         },
         input::NativeCapturedEvent::Motion {
+            source,
             sequence,
             timestamp_micros,
             dx,
             dy,
         } => {
-            motion_tx.send_replace(Some(Motion {
-                sequence,
-                timestamp_micros,
-                dx,
-                dy,
-            }));
+            motion_tx.send_replace(Some((
+                source,
+                Motion {
+                    sequence,
+                    timestamp_micros,
+                    dx,
+                    dy,
+                },
+            )));
         }
     });
     let threads = input::spawn_capture(paths, grab, callback, stop.clone())?;
@@ -137,21 +153,21 @@ pub struct InputInjector {
 }
 
 impl InputInjector {
-    pub fn new() -> Result<Self> {
+    pub fn new(paths: &[PathBuf]) -> Result<Self> {
         Ok(Self {
-            inner: input::Injector::new()?,
+            inner: input::Injector::new(paths)?,
         })
     }
 
-    pub fn emit(&mut self, event: InputEvent) -> Result<()> {
+    pub fn emit(&mut self, source: usize, event: InputEvent) -> Result<()> {
         for (event_type, code, value) in encode_native_input(event) {
-            self.inner.emit_raw(event_type, code, value)?;
+            self.inner.emit_raw(source, event_type, code, value)?;
         }
         Ok(())
     }
 
-    pub fn emit_motion(&mut self, dx: i32, dy: i32) -> Result<()> {
-        self.inner.emit_motion(dx, dy)
+    pub fn emit_motion(&mut self, source: usize, dx: i32, dy: i32) -> Result<()> {
+        self.inner.emit_motion(source, dx, dy)
     }
 
     pub fn set_cursor_position(&mut self, x: i32, y: i32) -> Result<()> {
