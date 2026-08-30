@@ -90,7 +90,9 @@ rflow layout
 
 The four relative placement options are `--left-of`, `--right-of`, `--above`, and `--below`.
 Configuration is persisted in the platform application directory and applied to the running
-session immediately. Later `rflow host` invocations reuse it without a direction argument.
+session immediately. Layout inspection and editing also work while the Host is stopped; those
+changes take effect on its next start. Later `rflow host` invocations reuse the layout without a
+direction argument.
 
 Advanced and scripted layout management uses exact edges:
 

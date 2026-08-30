@@ -207,17 +207,14 @@ async fn main() -> Result<()> {
 
 async fn run_layout(command: Option<LayoutSubcommand>, watch: bool, json: bool) -> Result<()> {
     let path = default_endpoint_path()?;
+    let topology_path = rflow::topology_store::default_path()?;
     if let Some(command) = command {
-        let topology = request_topology(&path).await?;
-        return run_layout_command(&path, topology, command).await;
+        let topology = request_topology(&path, &topology_path).await?;
+        return run_layout_command(&path, &topology_path, topology, command).await;
     }
     let mut last_revision = None;
     loop {
-        let topology = match management_request(&path, ManagementRequest::Layout).await? {
-            ManagementResponse::Layout(topology) => topology,
-            ManagementResponse::Error(message) => bail!("{message}"),
-            _ => bail!("rflow host returned an invalid management response"),
-        };
+        let topology = request_topology(&path, &topology_path).await?;
         if last_revision != Some(topology.revision) {
             if watch && last_revision.is_some() && io::stdout().is_terminal() {
                 print!("\x1b[2J\x1b[H");
@@ -240,16 +237,35 @@ async fn run_layout(command: Option<LayoutSubcommand>, watch: bool, json: bool) 
     }
 }
 
-async fn request_topology(path: &std::path::Path) -> Result<ScreenTopology> {
-    match management_request(path, ManagementRequest::Layout).await? {
-        ManagementResponse::Layout(topology) => Ok(topology),
-        ManagementResponse::Error(message) => bail!("{message}"),
-        _ => bail!("rflow host returned an invalid management response"),
+async fn request_topology(
+    path: &std::path::Path,
+    topology_path: &std::path::Path,
+) -> Result<ScreenTopology> {
+    match management_request(path, ManagementRequest::Layout).await {
+        Ok(ManagementResponse::Layout(topology)) => Ok(topology),
+        Ok(ManagementResponse::Error(message)) => bail!("{message}"),
+        Ok(_) => bail!("rflow host returned an invalid management response"),
+        Err(error) if management_endpoint_unavailable(&error) => {
+            Ok(rflow::topology_store::load(topology_path)?.unwrap_or_default())
+        }
+        Err(error) => Err(error),
     }
+}
+
+fn management_endpoint_unavailable(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            )
+        })
+    })
 }
 
 async fn run_layout_command(
     path: &std::path::Path,
+    topology_path: &std::path::Path,
     topology: ScreenTopology,
     command: LayoutSubcommand,
 ) -> Result<()> {
@@ -270,7 +286,13 @@ async fn run_layout_command(
             expected_revision,
         } => {
             let layout: ScreenLayout = serde_json::from_slice(&std::fs::read(file)?)?;
-            submit_layout_command(path, expected_revision, LayoutCommand::Replace { layout }).await
+            submit_layout_command(
+                path,
+                topology_path,
+                expected_revision,
+                LayoutCommand::Replace { layout },
+            )
+            .await
         }
         LayoutSubcommand::Place {
             screen,
@@ -295,6 +317,7 @@ async fn run_layout_command(
             let anchor_id = resolve_screen_id(&topology, &anchor)?;
             submit_layout_command(
                 path,
+                topology_path,
                 topology.revision,
                 LayoutCommand::Place {
                     screen_id,
@@ -310,6 +333,7 @@ async fn run_layout_command(
             let to = resolve_edge(&topology, to)?;
             submit_layout_command(
                 path,
+                topology_path,
                 topology.revision,
                 LayoutCommand::Link { from, to, replace },
             )
@@ -317,12 +341,19 @@ async fn run_layout_command(
         }
         LayoutSubcommand::Unlink { edge } => {
             let edge = resolve_edge(&topology, edge)?;
-            submit_layout_command(path, topology.revision, LayoutCommand::Unlink { edge }).await
+            submit_layout_command(
+                path,
+                topology_path,
+                topology.revision,
+                LayoutCommand::Unlink { edge },
+            )
+            .await
         }
         LayoutSubcommand::Unplace { screen } => {
             let screen_id = resolve_screen_id(&topology, &screen)?;
             submit_layout_command(
                 path,
+                topology_path,
                 topology.revision,
                 LayoutCommand::Unplace { screen_id },
             )
@@ -332,6 +363,7 @@ async fn run_layout_command(
             let screen_id = resolve_screen_id(&topology, &screen)?;
             submit_layout_command(
                 path,
+                topology_path,
                 topology.revision,
                 LayoutCommand::SetSizeOverride {
                     screen_id,
@@ -344,6 +376,7 @@ async fn run_layout_command(
             let screen_id = resolve_screen_id(&topology, &screen)?;
             submit_layout_command(
                 path,
+                topology_path,
                 topology.revision,
                 LayoutCommand::SetSizeOverride {
                     screen_id,
@@ -357,24 +390,40 @@ async fn run_layout_command(
 
 async fn submit_layout_command(
     path: &std::path::Path,
+    topology_path: &std::path::Path,
     expected_revision: u64,
     command: LayoutCommand,
 ) -> Result<()> {
-    match management_request(
+    let response = management_request(
         path,
         ManagementRequest::ApplyLayout {
             expected_revision,
-            command,
+            command: command.clone(),
         },
     )
-    .await?
-    {
-        ManagementResponse::LayoutUpdated(topology) => {
+    .await;
+    match response {
+        Ok(ManagementResponse::LayoutUpdated(topology)) => {
             println!("Layout updated to revision {}.", topology.revision);
             Ok(())
         }
-        ManagementResponse::Error(message) => bail!("{message}"),
-        _ => bail!("rflow host returned an invalid management response"),
+        Ok(ManagementResponse::Error(message)) => bail!("{message}"),
+        Ok(_) => bail!("rflow host returned an invalid management response"),
+        Err(error) if management_endpoint_unavailable(&error) => {
+            let state = rflow::topology_store::load_state(topology_path)?;
+            let topology = rflow::topology_store::apply(
+                topology_path,
+                expected_revision,
+                &state.inventory,
+                command,
+            )?;
+            println!(
+                "Layout updated to revision {}. It will take effect when rflow host starts.",
+                topology.revision
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -807,6 +856,40 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn offline_layout_read_does_not_require_management_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let management_path = directory.path().join("missing.sock");
+        let topology_path = directory.path().join("topology.json");
+
+        let topology = request_topology(&management_path, &topology_path)
+            .await
+            .expect("offline layout should load from local storage");
+
+        assert_eq!(topology, ScreenTopology::default());
+    }
+
+    #[tokio::test]
+    async fn offline_layout_mutation_persists_without_management_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let management_path = directory.path().join("missing.sock");
+        let topology_path = directory.path().join("topology.json");
+
+        submit_layout_command(
+            &management_path,
+            &topology_path,
+            0,
+            LayoutCommand::Replace {
+                layout: ScreenLayout::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let state = rflow::topology_store::load_state(&topology_path).unwrap();
+        assert_eq!(state.layout.revision, 1);
+    }
 
     #[test]
     fn control_transitions_name_both_screens_and_boundary_action() {
