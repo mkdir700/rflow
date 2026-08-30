@@ -157,8 +157,9 @@ impl Injector {
     }
 
     pub fn set_cursor_position(&mut self, x: i32, y: i32) -> Result<()> {
+        let lua = format!("hl.dispatch(hl.dsp.cursor.move({{ x = {x}, y = {y} }}))");
         if Command::new("hyprctl")
-            .args(["dispatch", "movecursor", &x.to_string(), &y.to_string()])
+            .args(["eval", &lua])
             .status()
             .is_ok_and(|status| status.success())
         {
