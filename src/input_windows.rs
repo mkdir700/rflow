@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tokio::sync::{mpsc, watch};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, MOUSEEVENTF_HWHEEL,
@@ -103,7 +103,7 @@ fn send_inputs(inputs: &[INPUT]) -> Result<()> {
         )
     };
     if sent != inputs.len() as u32 {
-        bail!(std::io::Error::last_os_error()).context("inject Windows input")
+        Err(anyhow::Error::new(std::io::Error::last_os_error()).context("inject Windows input"))
     } else {
         Ok(())
     }
