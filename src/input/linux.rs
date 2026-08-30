@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs,
     path::PathBuf,
     process::Command,
@@ -7,7 +8,8 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::SystemTime,
+    thread,
+    time::{Duration, SystemTime},
 };
 
 use crate::{core::ScreenSize, platform::DetectedScreen};
@@ -443,12 +445,20 @@ impl Injector {
                 pointer_source: 0,
             });
         }
+        let hypr_before = hypr_keyboards();
         let mut devices = Vec::with_capacity(paths.len());
+        let mut keyboard_profiles = Vec::new();
         let mut pointer_source = None;
         for (source_index, path) in paths.iter().enumerate() {
             let source = Device::open(path)
                 .with_context(|| format!("inspect input device {}", path.display()))?;
             let name = source.name().unwrap_or("rflow input");
+            if let Some(profile) = hypr_before
+                .as_ref()
+                .and_then(|keyboards| keyboards.iter().find(|keyboard| keyboard.name == name))
+            {
+                keyboard_profiles.push(profile.clone());
+            }
             let mut builder = VirtualDevice::builder()
                 .context("open /dev/uinput")?
                 .name(name);
@@ -470,6 +480,9 @@ impl Injector {
                     .build()
                     .with_context(|| format!("create virtual clone of {name}"))?,
             );
+        }
+        if let Some(before) = hypr_before {
+            sync_hypr_keyboard_profiles(&before, &keyboard_profiles);
         }
         Ok(Self {
             devices,
@@ -525,6 +538,102 @@ impl Injector {
         self.devices
             .get_mut(source)
             .with_context(|| format!("input source {source} has no virtual device"))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct HyprKeyboard {
+    address: String,
+    name: String,
+    rules: String,
+    model: String,
+    layout: String,
+    variant: String,
+    options: String,
+}
+
+#[derive(Deserialize)]
+struct HyprDevices {
+    keyboards: Vec<HyprKeyboard>,
+}
+
+fn hypr_keyboards() -> Option<Vec<HyprKeyboard>> {
+    let output = Command::new("hyprctl")
+        .args(["devices", "-j"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice::<HyprDevices>(&output.stdout)
+        .ok()
+        .map(|devices| devices.keyboards)
+}
+
+fn sync_hypr_keyboard_profiles(before: &[HyprKeyboard], profiles: &[HyprKeyboard]) {
+    if profiles.is_empty() {
+        return;
+    }
+    let old_addresses: HashSet<&str> = before
+        .iter()
+        .map(|keyboard| keyboard.address.as_str())
+        .collect();
+    for _ in 0..20 {
+        if let Some(current) = hypr_keyboards() {
+            let mut pending = false;
+            for profile in profiles {
+                let virtual_keyboard = current.iter().find(|keyboard| {
+                    !old_addresses.contains(keyboard.address.as_str())
+                        && virtual_device_name_matches(&keyboard.name, &profile.name)
+                });
+                if let Some(virtual_keyboard) = virtual_keyboard {
+                    apply_hypr_keyboard_profile(&virtual_keyboard.name, profile);
+                } else {
+                    pending = true;
+                }
+            }
+            if !pending {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    tracing::warn!("timed out synchronizing virtual keyboard settings with Hyprland");
+}
+
+fn virtual_device_name_matches(candidate: &str, physical: &str) -> bool {
+    candidate == physical
+        || candidate
+            .strip_prefix(physical)
+            .and_then(|suffix| suffix.strip_prefix('-'))
+            .is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            })
+}
+
+fn apply_hypr_keyboard_profile(name: &str, profile: &HyprKeyboard) {
+    let string = |value: &str| serde_json::to_string(value).expect("serialize Hyprland string");
+    let lua = format!(
+        "hl.device({{ name = {}, kb_rules = {}, kb_model = {}, kb_layout = {}, kb_variant = {}, kb_options = {} }})",
+        string(name),
+        string(&profile.rules),
+        string(&profile.model),
+        string(&profile.layout),
+        string(&profile.variant),
+        string(&profile.options),
+    );
+    match Command::new("hyprctl").args(["eval", &lua]).output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => tracing::warn!(
+            keyboard = name,
+            error = %String::from_utf8_lossy(&output.stderr),
+            "failed to apply physical keyboard settings to virtual keyboard"
+        ),
+        Err(error) => tracing::warn!(
+            keyboard = name,
+            %error,
+            "failed to invoke Hyprland while configuring virtual keyboard"
+        ),
     }
 }
 
@@ -595,6 +704,26 @@ mod discovery_tests {
         assert!(forwarded.contains(RelativeAxisCode::REL_HWHEEL));
         assert!(!forwarded.contains(RelativeAxisCode::REL_WHEEL_HI_RES));
         assert!(!forwarded.contains(RelativeAxisCode::REL_HWHEEL_HI_RES));
+    }
+
+    #[test]
+    fn hyprland_suffixes_are_matched_without_accepting_similar_device_names() {
+        assert!(virtual_device_name_matches(
+            "hhkb-hybrid_3-keyboard-1",
+            "hhkb-hybrid_3-keyboard"
+        ));
+        assert!(virtual_device_name_matches(
+            "hhkb-hybrid_3-keyboard-12",
+            "hhkb-hybrid_3-keyboard"
+        ));
+        assert!(!virtual_device_name_matches(
+            "hhkb-hybrid_3-keyboard-extra",
+            "hhkb-hybrid_3-keyboard"
+        ));
+        assert!(!virtual_device_name_matches(
+            "hhkb-hybrid_3-keyboard-pro-1",
+            "hhkb-hybrid_3-keyboard"
+        ));
     }
 
     #[test]
