@@ -15,8 +15,8 @@ use tokio::sync::{mpsc, watch};
 
 use crate::{
     core::{
-        ControlTarget, DesktopSession, Motion, ScreenDirection, ScreenSize, SessionEffect,
-        SessionEvent,
+        ControlTarget, DesktopSession, Motion, ScreenDirection, ScreenId, ScreenNode, ScreenSize,
+        ScreenTopology, SessionEffect, SessionEvent, TopologyDeviceId,
     },
     identity::IdentityPaths,
     pairing::{
@@ -91,6 +91,10 @@ pub enum AppCommand {
     UpdateConfig(AppConfig),
     AcceptPairing(PairingRequestId),
     RejectPairing(PairingRequestId),
+    ReplaceTopology {
+        expected_revision: u64,
+        topology: ScreenTopology,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +141,7 @@ pub enum AppEvent {
     PairingCleared(PairingRequestId),
     PairingExpired(PairingRequestId),
     PeerTrusted(PeerSummary),
+    TopologyChanged(ScreenTopology),
     Faulted(AppFault),
 }
 
@@ -148,6 +153,7 @@ pub struct RuntimeSnapshot {
     pub config: AppConfig,
     pub fault: Option<AppFault>,
     pub pairing: Option<PairingRequestSummary>,
+    pub topology: ScreenTopology,
 }
 
 impl Default for RuntimeSnapshot {
@@ -159,6 +165,7 @@ impl Default for RuntimeSnapshot {
             config: AppConfig::default(),
             fault: None,
             pairing: None,
+            topology: ScreenTopology::default(),
         }
     }
 }
@@ -208,6 +215,7 @@ impl AppEventBus {
                 }
             }
             AppEvent::PeerTrusted(_) => {}
+            AppEvent::TopologyChanged(topology) => snapshot.topology = topology.clone(),
             AppEvent::Faulted(fault) => snapshot.fault = Some(fault.clone()),
         }
     }
@@ -425,6 +433,20 @@ async fn supervisor(
                 continue;
             }
             AppCommand::AcceptPairing(_) | AppCommand::RejectPairing(_) => continue,
+            AppCommand::ReplaceTopology {
+                expected_revision,
+                topology,
+            } => {
+                match crate::topology_store::replace(
+                    &crate::topology_store::default_path().expect("resolve topology path"),
+                    expected_revision,
+                    topology,
+                ) {
+                    Ok(topology) => events.send(AppEvent::TopologyChanged(topology)).await,
+                    Err(error) => events.send(AppEvent::Faulted(classify_fault(&error))).await,
+                }
+                continue;
+            }
         };
         publish_status(&events, RuntimeStatus::Starting).await;
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -474,6 +496,16 @@ async fn supervisor(
                                 accepted: true,
                             })
                             .await;
+                    }
+                    Some(AppCommand::ReplaceTopology { expected_revision, topology }) => {
+                        match crate::topology_store::replace(
+                            &crate::topology_store::default_path().expect("resolve topology path"),
+                            expected_revision,
+                            topology,
+                        ) {
+                            Ok(topology) => events.send(AppEvent::TopologyChanged(topology)).await,
+                            Err(error) => events.send(AppEvent::Faulted(classify_fault(&error))).await,
+                        }
                     }
                     Some(AppCommand::RejectPairing(request_id)) => {
                         let _ = pairing_tx
@@ -569,7 +601,15 @@ async fn run_host(
     let direction = config
         .direction
         .context("screen direction is required; pass --direction")?;
-    let size = config.size.unwrap_or(platform::screen_size()?);
+    let detected_screens = platform::screens()?;
+    let size = config.size.unwrap_or(
+        detected_screens
+            .iter()
+            .find(|screen| screen.primary)
+            .or_else(|| detected_screens.first())
+            .context("platform reported no active screens")?
+            .logical_size,
+    );
     config.size = Some(size);
     config.devices = platform::resolve_capture_devices(&config.devices)?;
     platform::validate_capture(&config.devices)?;
@@ -577,6 +617,16 @@ async fn run_host(
         certificate: config.cert.clone(),
         private_key: config.key.clone(),
     };
+    let local_device_id = DeviceId::from_certificate(
+        &fs::read(&config.cert).context("read host identity certificate")?,
+    );
+    events
+        .send(AppEvent::TopologyChanged(discovered_topology(
+            &config.device_name,
+            local_device_id,
+            detected_screens,
+        )))
+        .await;
     let endpoint = transport::pairing_server_endpoint(config.bind, &identity)?;
     let mut trust = TrustStore::load(&config.trust_store)?;
     let mut pairing_rate_limiter = PairingRateLimiter::default();
@@ -937,10 +987,15 @@ async fn run_client(
     events: AppEventBus,
     diagnostics: Arc<dyn DiagnosticSink>,
 ) -> Result<()> {
-    let size = match config.size {
-        Some(size) => size,
-        None => platform::screen_size()?,
-    };
+    let detected_screens = platform::screens()?;
+    let size = config.size.unwrap_or(
+        detected_screens
+            .iter()
+            .find(|screen| screen.primary)
+            .or_else(|| detected_screens.first())
+            .context("platform reported no active screens")?
+            .logical_size,
+    );
     config.size = Some(size);
     let target = config.target.resolve().await?;
     let bind_ip = if target.is_ipv4() {
@@ -952,6 +1007,16 @@ async fn run_client(
         certificate: config.identity_cert.clone(),
         private_key: config.identity_key.clone(),
     };
+    let local_device_id = DeviceId::from_certificate(
+        &fs::read(&config.identity_cert).context("read client identity certificate")?,
+    );
+    events
+        .send(AppEvent::TopologyChanged(discovered_topology(
+            &config.device_name,
+            local_device_id,
+            detected_screens,
+        )))
+        .await;
     let endpoint = transport::pairing_client_endpoint(SocketAddr::new(bind_ip, 0), &identity)?;
     let mut trust = TrustStore::load(&config.trust_store)?;
     let retry_deadline = tokio::time::Instant::now() + config.retry_for;
@@ -991,6 +1056,29 @@ async fn run_client(
             }
             Err(error) => return Err(error),
         }
+    }
+}
+
+fn discovered_topology(
+    device_name: &str,
+    device_id: DeviceId,
+    screens: Vec<platform::DetectedScreen>,
+) -> ScreenTopology {
+    ScreenTopology {
+        revision: 1,
+        screens: screens
+            .into_iter()
+            .map(|screen| ScreenNode {
+                screen_id: ScreenId(screen.stable_id),
+                device_id: TopologyDeviceId(device_id.to_string()),
+                device_name: device_name.to_owned(),
+                name: screen.name,
+                logical_size: screen.logical_size,
+                online: true,
+                this_device: true,
+            })
+            .collect(),
+        links: Vec::new(),
     }
 }
 
@@ -1375,6 +1463,7 @@ mod tests {
                 config: AppConfig::default(),
                 fault: Some(fault),
                 pairing: None,
+                topology: ScreenTopology::default(),
             }
         );
         runtime.shutdown().await.unwrap();
@@ -1404,6 +1493,10 @@ mod tests {
             runtime.next_event().await,
             Some(AppEvent::StatusChanged(RuntimeStatus::Starting))
         );
+        assert!(matches!(
+            runtime.next_event().await,
+            Some(AppEvent::TopologyChanged(_))
+        ));
         assert_eq!(
             runtime.next_event().await,
             Some(AppEvent::StatusChanged(RuntimeStatus::Listening))

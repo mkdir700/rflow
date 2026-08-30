@@ -84,6 +84,21 @@ enum Command {
         #[command(subcommand)]
         command: Option<PeersCommand>,
     },
+    /// Render the authoritative screen topology.
+    Layout {
+        /// Redraw whenever the topology revision changes.
+        #[arg(long)]
+        watch: bool,
+        /// Emit the versioned machine-readable schema.
+        #[arg(long, conflicts_with = "watch")]
+        json: bool,
+        /// Replace the topology from a JSON file through the running host.
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["watch", "json"], requires = "expected_revision")]
+        apply: Option<PathBuf>,
+        /// Revision observed before editing; prevents lost updates.
+        #[arg(long, requires = "apply")]
+        expected_revision: Option<u64>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -115,7 +130,70 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Peers { command } => run_peers(command).await,
+        Command::Layout {
+            watch,
+            json,
+            apply,
+            expected_revision,
+        } => run_layout(watch, json, apply, expected_revision).await,
         command => run_session(command).await,
+    }
+}
+
+async fn run_layout(
+    watch: bool,
+    json: bool,
+    apply: Option<PathBuf>,
+    expected_revision: Option<u64>,
+) -> Result<()> {
+    let path = default_endpoint_path()?;
+    if let Some(file) = apply {
+        let topology: rflow::core::ScreenTopology =
+            serde_json::from_slice(&std::fs::read(&file).map_err(anyhow::Error::from)?)?;
+        topology.validate().map_err(anyhow::Error::msg)?;
+        return match management_request(
+            &path,
+            ManagementRequest::ReplaceTopology {
+                expected_revision: expected_revision.expect("clap requires the revision"),
+                topology,
+            },
+        )
+        .await?
+        {
+            ManagementResponse::TopologyQueued => {
+                println!("Topology update queued.");
+                Ok(())
+            }
+            ManagementResponse::Error(message) => bail!("{message}"),
+            _ => bail!("rflow host returned an invalid management response"),
+        };
+    }
+    let mut last_revision = None;
+    loop {
+        let topology = match management_request(&path, ManagementRequest::Layout).await? {
+            ManagementResponse::Layout(topology) => topology,
+            ManagementResponse::Error(message) => bail!("{message}"),
+            _ => bail!("rflow host returned an invalid management response"),
+        };
+        if last_revision != Some(topology.revision) {
+            if watch && last_revision.is_some() && io::stdout().is_terminal() {
+                print!("\x1b[2J\x1b[H");
+            }
+            println!(
+                "{}",
+                if json {
+                    rflow::layout::render_json(&topology)?
+                } else {
+                    rflow::layout::render_text(&topology)
+                }
+            );
+            io::stdout().flush()?;
+            last_revision = Some(topology.revision);
+        }
+        if !watch {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -147,6 +225,12 @@ async fn run_peers(command: Option<PeersCommand>) -> Result<()> {
                 ManagementResponse::Pending(None) => println!("No pending pairing requests."),
                 ManagementResponse::Error(message) => bail!("{message}"),
                 ManagementResponse::DecisionQueued => {
+                    bail!("rflow host returned an invalid management response")
+                }
+                ManagementResponse::Layout(_) => {
+                    bail!("rflow host returned an invalid management response")
+                }
+                ManagementResponse::TopologyQueued => {
                     bail!("rflow host returned an invalid management response")
                 }
             }
@@ -190,6 +274,12 @@ async fn submit_pairing_decision(request_id: PairingRequestId, accepted: bool) -
         ManagementResponse::DecisionQueued => Ok(()),
         ManagementResponse::Error(message) => bail!("{message}"),
         ManagementResponse::Pending(_) => {
+            bail!("rflow host returned an invalid management response")
+        }
+        ManagementResponse::Layout(_) => {
+            bail!("rflow host returned an invalid management response")
+        }
+        ManagementResponse::TopologyQueued => {
             bail!("rflow host returned an invalid management response")
         }
     }
@@ -271,6 +361,7 @@ async fn run_session(command: Command) -> Result<()> {
                 Some(AppEvent::PeerTrusted(peer)) => {
                     tracing::info!(device_id = %peer.device_id, name = %peer.display_name, "peer trusted");
                 }
+                Some(AppEvent::TopologyChanged(_)) => {}
                 Some(AppEvent::Faulted(error)) => {
                     fault = Some(error);
                     break;
@@ -357,6 +448,9 @@ impl Command {
             Command::Keygen { .. } => unreachable!("keygen is handled before session startup"),
             Command::Peers { .. } => {
                 unreachable!("peer management is handled before session startup")
+            }
+            Command::Layout { .. } => {
+                unreachable!("layout is handled before session startup")
             }
         })
     }

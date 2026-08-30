@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    core::ScreenTopology,
     pairing::PairingRequestId,
     runtime::{AppCommand, ApplicationHandle},
 };
@@ -11,7 +12,7 @@ use crate::{
 #[cfg(unix)]
 use crate::identity::application_config_directory;
 
-const MANAGEMENT_PROTOCOL_VERSION: u16 = 1;
+const MANAGEMENT_PROTOCOL_VERSION: u16 = 2;
 const MAX_MANAGEMENT_FRAME: usize = 64 * 1024;
 #[cfg(unix)]
 pub const MANAGEMENT_SOCKET_FILE: &str = "management.sock";
@@ -19,6 +20,11 @@ pub const MANAGEMENT_SOCKET_FILE: &str = "management.sock";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ManagementRequest {
     Pending,
+    Layout,
+    ReplaceTopology {
+        expected_revision: u64,
+        topology: ScreenTopology,
+    },
     Accept(u64),
     Reject(u64),
 }
@@ -37,6 +43,8 @@ pub struct PendingPairing {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ManagementResponse {
     Pending(Option<PendingPairing>),
+    Layout(ScreenTopology),
+    TopologyQueued,
     DecisionQueued,
     Error(String),
 }
@@ -70,6 +78,22 @@ async fn dispatch(
         .unwrap_or_default()
         .as_secs();
     match request {
+        ManagementRequest::Layout => ManagementResponse::Layout(application.snapshot().topology),
+        ManagementRequest::ReplaceTopology {
+            expected_revision,
+            topology,
+        } => {
+            match application
+                .send(AppCommand::ReplaceTopology {
+                    expected_revision,
+                    topology,
+                })
+                .await
+            {
+                Ok(()) => ManagementResponse::TopologyQueued,
+                Err(error) => ManagementResponse::Error(error.to_string()),
+            }
+        }
         ManagementRequest::Pending => {
             ManagementResponse::Pending(pending.map(|request| PendingPairing {
                 request_id: request.request_id.to_string(),

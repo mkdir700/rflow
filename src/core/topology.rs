@@ -1,4 +1,236 @@
-use std::{fmt, str::FromStr};
+use std::{collections::HashSet, fmt, str::FromStr};
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ScreenId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TopologyDeviceId(pub String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Edge {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ScreenEdge {
+    pub screen_id: ScreenId,
+    pub edge: Edge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenNode {
+    pub screen_id: ScreenId,
+    pub device_id: TopologyDeviceId,
+    pub device_name: String,
+    pub name: String,
+    pub logical_size: ScreenSize,
+    pub online: bool,
+    pub this_device: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenLink {
+    pub from: ScreenEdge,
+    pub to: ScreenEdge,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenTopology {
+    pub revision: u64,
+    pub screens: Vec<ScreenNode>,
+    pub links: Vec<ScreenLink>,
+}
+
+impl ScreenTopology {
+    pub fn validate(&self) -> Result<(), String> {
+        let mut ids = HashSet::new();
+        for screen in &self.screens {
+            if screen.screen_id.0.trim().is_empty() {
+                return Err("screen ID cannot be empty".to_owned());
+            }
+            if !ids.insert(&screen.screen_id) {
+                return Err(format!("duplicate screen ID {}", screen.screen_id.0));
+            }
+        }
+        let mut occupied = HashSet::new();
+        for link in &self.links {
+            if link.from == link.to {
+                return Err("a screen edge cannot link to itself".to_owned());
+            }
+            if !ids.contains(&link.from.screen_id) || !ids.contains(&link.to.screen_id) {
+                return Err("screen link references an unknown screen".to_owned());
+            }
+            if !occupied.insert(&link.from) || !occupied.insert(&link.to) {
+                return Err("a screen edge can participate in only one link".to_owned());
+            }
+            if opposite(link.from.edge) != link.to.edge {
+                return Err("linked screen edges must face each other".to_owned());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TopologyRoute {
+    Stay {
+        screen_id: ScreenId,
+        dx: i32,
+        dy: i32,
+    },
+    Cross {
+        screen_id: ScreenId,
+        x: i32,
+        y: i32,
+    },
+}
+
+pub struct TopologyRouter<'a> {
+    topology: &'a ScreenTopology,
+    active: ScreenId,
+    x: i32,
+    y: i32,
+}
+
+impl<'a> TopologyRouter<'a> {
+    pub fn new(
+        topology: &'a ScreenTopology,
+        active: ScreenId,
+        x: i32,
+        y: i32,
+    ) -> Result<Self, String> {
+        topology.validate()?;
+        let size = topology
+            .screens
+            .iter()
+            .find(|screen| screen.screen_id == active)
+            .ok_or_else(|| format!("active screen {} is not in the topology", active.0))?
+            .logical_size;
+        Ok(Self {
+            topology,
+            active,
+            x: x.clamp(0, size.width - 1),
+            y: y.clamp(0, size.height - 1),
+        })
+    }
+
+    pub fn active_screen(&self) -> &ScreenId {
+        &self.active
+    }
+
+    pub fn route_motion(&mut self, dx: i32, dy: i32) -> TopologyRoute {
+        let size = self.screen_size(&self.active);
+        let next_x = self.x.saturating_add(dx);
+        let next_y = self.y.saturating_add(dy);
+        let crossed = if next_x < 0 {
+            Some((Edge::Left, next_x, next_y))
+        } else if next_x >= size.width {
+            Some((Edge::Right, next_x - (size.width - 1), next_y))
+        } else if next_y < 0 {
+            Some((Edge::Top, next_x, next_y))
+        } else if next_y >= size.height {
+            Some((Edge::Bottom, next_x, next_y - (size.height - 1)))
+        } else {
+            None
+        };
+        if let Some((edge, overflow_x, overflow_y)) = crossed
+            && let Some(target) = self.linked_edge(edge).cloned()
+        {
+            let target_size = self.screen_size(&target.screen_id);
+            let (x, y) = match edge {
+                Edge::Left => (
+                    target_size.width.saturating_sub(2),
+                    scale_axis(
+                        next_y.clamp(0, size.height - 1),
+                        size.height,
+                        target_size.height,
+                    ),
+                ),
+                Edge::Right => (
+                    overflow_x.clamp(0, target_size.width - 1),
+                    scale_axis(
+                        next_y.clamp(0, size.height - 1),
+                        size.height,
+                        target_size.height,
+                    ),
+                ),
+                Edge::Top => (
+                    scale_axis(
+                        next_x.clamp(0, size.width - 1),
+                        size.width,
+                        target_size.width,
+                    ),
+                    target_size.height.saturating_sub(2),
+                ),
+                Edge::Bottom => (
+                    scale_axis(
+                        next_x.clamp(0, size.width - 1),
+                        size.width,
+                        target_size.width,
+                    ),
+                    overflow_y.clamp(0, target_size.height - 1),
+                ),
+            };
+            self.active = target.screen_id;
+            self.x = x;
+            self.y = y;
+            return TopologyRoute::Cross {
+                screen_id: self.active.clone(),
+                x,
+                y,
+            };
+        }
+        self.x = next_x.clamp(0, size.width - 1);
+        self.y = next_y.clamp(0, size.height - 1);
+        TopologyRoute::Stay {
+            screen_id: self.active.clone(),
+            dx,
+            dy,
+        }
+    }
+
+    fn linked_edge(&self, edge: Edge) -> Option<&ScreenEdge> {
+        let source = ScreenEdge {
+            screen_id: self.active.clone(),
+            edge,
+        };
+        self.topology.links.iter().find_map(|link| {
+            if link.from == source {
+                Some(&link.to)
+            } else if link.to == source {
+                Some(&link.from)
+            } else {
+                None
+            }
+        })
+    }
+
+    fn screen_size(&self, id: &ScreenId) -> ScreenSize {
+        self.topology
+            .screens
+            .iter()
+            .find(|screen| &screen.screen_id == id)
+            .expect("validated topology contains routed screen")
+            .logical_size
+    }
+}
+
+fn opposite(edge: Edge) -> Edge {
+    match edge {
+        Edge::Top => Edge::Bottom,
+        Edge::Right => Edge::Left,
+        Edge::Bottom => Edge::Top,
+        Edge::Left => Edge::Right,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenSizeParseError(String);
@@ -11,7 +243,7 @@ impl fmt::Display for ScreenSizeParseError {
 
 impl std::error::Error for ScreenSizeParseError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScreenSize {
     pub width: i32,
     pub height: i32,
@@ -373,6 +605,18 @@ fn scale_axis(value: i32, from: i32, to: i32) -> i32 {
 mod tests {
     use super::*;
 
+    fn node(id: &str) -> ScreenNode {
+        ScreenNode {
+            screen_id: ScreenId(id.to_owned()),
+            device_id: TopologyDeviceId(format!("device-{id}")),
+            device_name: format!("device-{id}"),
+            name: "display-1".to_owned(),
+            logical_size: ScreenSize::new(100, 100).unwrap(),
+            online: true,
+            this_device: id == "a",
+        }
+    }
+
     fn router() -> CursorRouter {
         CursorRouter::right(
             ScreenSize::new(1920, 1080).unwrap(),
@@ -531,5 +775,113 @@ mod tests {
         );
         assert!("2560".parse::<ScreenSize>().is_err());
         assert!("0x1440".parse::<ScreenSize>().is_err());
+    }
+
+    #[test]
+    fn topology_supports_three_devices_and_cycles() {
+        let topology = ScreenTopology {
+            revision: 3,
+            screens: vec![node("a"), node("b"), node("c")],
+            links: vec![
+                ScreenLink {
+                    from: ScreenEdge {
+                        screen_id: ScreenId("a".into()),
+                        edge: Edge::Right,
+                    },
+                    to: ScreenEdge {
+                        screen_id: ScreenId("b".into()),
+                        edge: Edge::Left,
+                    },
+                },
+                ScreenLink {
+                    from: ScreenEdge {
+                        screen_id: ScreenId("b".into()),
+                        edge: Edge::Bottom,
+                    },
+                    to: ScreenEdge {
+                        screen_id: ScreenId("c".into()),
+                        edge: Edge::Top,
+                    },
+                },
+                ScreenLink {
+                    from: ScreenEdge {
+                        screen_id: ScreenId("c".into()),
+                        edge: Edge::Left,
+                    },
+                    to: ScreenEdge {
+                        screen_id: ScreenId("a".into()),
+                        edge: Edge::Right,
+                    },
+                },
+            ],
+        };
+        assert!(
+            topology.validate().is_err(),
+            "a.right is intentionally conflicting"
+        );
+
+        let mut valid = topology;
+        valid.links.pop();
+        assert_eq!(valid.validate(), Ok(()));
+    }
+
+    #[test]
+    fn topology_rejects_unknown_endpoints_and_non_facing_edges() {
+        let mut topology = ScreenTopology {
+            revision: 1,
+            screens: vec![node("a"), node("b")],
+            links: vec![ScreenLink {
+                from: ScreenEdge {
+                    screen_id: ScreenId("a".into()),
+                    edge: Edge::Right,
+                },
+                to: ScreenEdge {
+                    screen_id: ScreenId("missing".into()),
+                    edge: Edge::Left,
+                },
+            }],
+        };
+        assert!(topology.validate().unwrap_err().contains("unknown"));
+        topology.links[0].to.screen_id = ScreenId("b".into());
+        topology.links[0].to.edge = Edge::Top;
+        assert!(topology.validate().unwrap_err().contains("face"));
+    }
+
+    #[test]
+    fn topology_router_crosses_a_three_screen_chain_by_named_links() {
+        let topology = ScreenTopology {
+            revision: 1,
+            screens: vec![node("a"), node("b"), node("c")],
+            links: vec![
+                ScreenLink {
+                    from: ScreenEdge {
+                        screen_id: ScreenId("a".into()),
+                        edge: Edge::Right,
+                    },
+                    to: ScreenEdge {
+                        screen_id: ScreenId("b".into()),
+                        edge: Edge::Left,
+                    },
+                },
+                ScreenLink {
+                    from: ScreenEdge {
+                        screen_id: ScreenId("b".into()),
+                        edge: Edge::Right,
+                    },
+                    to: ScreenEdge {
+                        screen_id: ScreenId("c".into()),
+                        edge: Edge::Left,
+                    },
+                },
+            ],
+        };
+        let mut router = TopologyRouter::new(&topology, ScreenId("a".into()), 98, 50).unwrap();
+        assert!(
+            matches!(router.route_motion(4, 0), TopologyRoute::Cross { screen_id: ScreenId(ref id), .. } if id == "b")
+        );
+        assert!(
+            matches!(router.route_motion(100, 0), TopologyRoute::Cross { screen_id: ScreenId(ref id), .. } if id == "c")
+        );
+        assert_eq!(router.active_screen(), &ScreenId("c".into()));
     }
 }

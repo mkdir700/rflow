@@ -1,11 +1,13 @@
 pub mod core;
 pub mod identity;
 pub(crate) mod input;
+pub mod layout;
 pub mod management;
 pub mod pairing;
 pub mod platform;
 pub mod protocol;
 pub mod runtime;
 pub mod target;
+pub mod topology_store;
 pub mod transport;
 pub mod trust;
