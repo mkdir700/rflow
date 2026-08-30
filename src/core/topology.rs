@@ -32,8 +32,16 @@ pub struct ScreenNode {
     pub device_name: String,
     pub name: String,
     pub logical_size: ScreenSize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_override: Option<ScreenSize>,
     pub online: bool,
     pub this_device: bool,
+}
+
+impl ScreenNode {
+    pub fn effective_size(&self) -> ScreenSize {
+        self.size_override.unwrap_or(self.logical_size)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +121,7 @@ impl<'a> TopologyRouter<'a> {
             .iter()
             .find(|screen| screen.screen_id == active)
             .ok_or_else(|| format!("active screen {} is not in the topology", active.0))?
-            .logical_size;
+            .effective_size();
         Ok(Self {
             topology,
             active,
@@ -219,7 +227,7 @@ impl<'a> TopologyRouter<'a> {
             .iter()
             .find(|screen| &screen.screen_id == id)
             .expect("validated topology contains routed screen")
-            .logical_size
+            .effective_size()
     }
 }
 
@@ -612,6 +620,7 @@ mod tests {
             device_name: format!("device-{id}"),
             name: "display-1".to_owned(),
             logical_size: ScreenSize::new(100, 100).unwrap(),
+            size_override: None,
             online: true,
             this_device: id == "a",
         }

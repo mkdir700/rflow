@@ -620,13 +620,13 @@ async fn run_host(
     let local_device_id = DeviceId::from_certificate(
         &fs::read(&config.cert).context("read host identity certificate")?,
     );
-    events
-        .send(AppEvent::TopologyChanged(discovered_topology(
-            &config.device_name,
-            local_device_id,
-            detected_screens,
-        )))
-        .await;
+    let topology = reconcile_discovered_topology(
+        crate::topology_store::load(&crate::topology_store::default_path()?)?,
+        &config.device_name,
+        local_device_id,
+        detected_screens,
+    );
+    events.send(AppEvent::TopologyChanged(topology)).await;
     let endpoint = transport::pairing_server_endpoint(config.bind, &identity)?;
     let mut trust = TrustStore::load(&config.trust_store)?;
     let mut pairing_rate_limiter = PairingRateLimiter::default();
@@ -1010,13 +1010,13 @@ async fn run_client(
     let local_device_id = DeviceId::from_certificate(
         &fs::read(&config.identity_cert).context("read client identity certificate")?,
     );
-    events
-        .send(AppEvent::TopologyChanged(discovered_topology(
-            &config.device_name,
-            local_device_id,
-            detected_screens,
-        )))
-        .await;
+    let topology = reconcile_discovered_topology(
+        crate::topology_store::load(&crate::topology_store::default_path()?)?,
+        &config.device_name,
+        local_device_id,
+        detected_screens,
+    );
+    events.send(AppEvent::TopologyChanged(topology)).await;
     let endpoint = transport::pairing_client_endpoint(SocketAddr::new(bind_ip, 0), &identity)?;
     let mut trust = TrustStore::load(&config.trust_store)?;
     let retry_deadline = tokio::time::Instant::now() + config.retry_for;
@@ -1059,27 +1059,44 @@ async fn run_client(
     }
 }
 
-fn discovered_topology(
+fn reconcile_discovered_topology(
+    saved: Option<ScreenTopology>,
     device_name: &str,
     device_id: DeviceId,
     screens: Vec<platform::DetectedScreen>,
 ) -> ScreenTopology {
-    ScreenTopology {
-        revision: 1,
-        screens: screens
-            .into_iter()
-            .map(|screen| ScreenNode {
-                screen_id: ScreenId(screen.stable_id),
-                device_id: TopologyDeviceId(device_id.to_string()),
+    let device_id = TopologyDeviceId(device_id.to_string());
+    let mut topology = saved.unwrap_or_default();
+    for node in &mut topology.screens {
+        node.online = false;
+        node.this_device = false;
+    }
+    for screen in screens {
+        let screen_id = ScreenId(format!("{}/{}", device_id.0, screen.stable_id));
+        if let Some(node) = topology
+            .screens
+            .iter_mut()
+            .find(|node| node.screen_id == screen_id && node.device_id == device_id)
+        {
+            node.device_name = device_name.to_owned();
+            node.name = screen.name;
+            node.logical_size = screen.logical_size;
+            node.online = true;
+            node.this_device = true;
+        } else {
+            topology.screens.push(ScreenNode {
+                screen_id,
+                device_id: device_id.clone(),
                 device_name: device_name.to_owned(),
                 name: screen.name,
                 logical_size: screen.logical_size,
+                size_override: None,
                 online: true,
                 this_device: true,
-            })
-            .collect(),
-        links: Vec::new(),
+            });
+        }
     }
+    topology
 }
 
 async fn run_client_once(
