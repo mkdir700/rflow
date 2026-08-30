@@ -93,12 +93,13 @@ On the client screen, connect to the host (use `-v` while diagnosing a connectio
 
 ```bash
 rflow client 192.168.1.50 -v \
-  --retry-for 120
+  --retry-for forever
 ```
 
 The client target accepts an IP address or hostname and defaults to UDP port 24801. `--retry-for`
-keeps retrying initial connections and reconnecting dropped sessions for the given
-number of seconds from client startup. This is useful when one Bluetooth keyboard and mouse must be
+keeps retrying initial connections and reconnecting dropped sessions. Pass a number to limit retries
+to that many seconds from client startup, or `forever` to retry every second until the client is
+stopped. This is useful when one Bluetooth keyboard and mouse must be
 switched back to the Linux host before its input devices become available.
 
 On the first connection, both terminals display the same six-digit pairing code. Compare the codes,

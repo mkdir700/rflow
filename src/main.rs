@@ -91,9 +91,9 @@ enum Command {
         /// Override automatic screen-size detection.
         #[arg(long)]
         size: Option<ScreenSize>,
-        /// Keep reconnecting for this many seconds after startup.
-        #[arg(long, default_value_t = 0)]
-        retry_for: u64,
+        /// Keep reconnecting for this many seconds after startup, or forever.
+        #[arg(long, default_value_t = RetryFor::Duration(Duration::ZERO))]
+        retry_for: RetryFor,
     },
     /// List and manage trusted devices.
     Peers {
@@ -111,6 +111,36 @@ enum Command {
         #[arg(long, conflicts_with = "watch")]
         json: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryFor {
+    Duration(Duration),
+    Forever,
+}
+
+impl std::fmt::Display for RetryFor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Duration(duration) => write!(formatter, "{}", duration.as_secs()),
+            Self::Forever => formatter.write_str("forever"),
+        }
+    }
+}
+
+impl std::str::FromStr for RetryFor {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.eq_ignore_ascii_case("forever") {
+            return Ok(Self::Forever);
+        }
+
+        value
+            .parse::<u64>()
+            .map(|seconds| Self::Duration(Duration::from_secs(seconds)))
+            .map_err(|_| "expected a number of seconds or 'forever'".to_owned())
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -1121,7 +1151,10 @@ impl Command {
                     identity_key: identity.private_key,
                     server_cert,
                     size,
-                    retry_for: Duration::from_secs(retry_for),
+                    retry_for: match retry_for {
+                        RetryFor::Duration(duration) => Some(duration),
+                        RetryFor::Forever => None,
+                    },
                     device_name: device_display_name(),
                     trust_store: default_trust_store_path()?,
                 })
@@ -1373,7 +1406,7 @@ mod tests {
             } => {
                 assert_eq!(target, "192.168.1.50:24801".parse().unwrap());
                 assert_eq!(size, None);
-                assert_eq!(retry_for, 0);
+                assert_eq!(retry_for, RetryFor::Duration(Duration::ZERO));
             }
             _ => panic!("expected client command"),
         }
@@ -1408,9 +1441,62 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Command::Client { retry_for, .. } => assert_eq!(retry_for, 120),
+            Command::Client { retry_for, .. } => {
+                assert_eq!(retry_for, RetryFor::Duration(Duration::from_secs(120)))
+            }
             _ => panic!("expected client command"),
         }
+    }
+
+    #[test]
+    fn client_accepts_infinite_retry_window() {
+        let cli = Cli::try_parse_from([
+            "rflow",
+            "client",
+            "192.168.1.50:24801",
+            "--retry-for",
+            "forever",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Client { retry_for, .. } => assert_eq!(retry_for, RetryFor::Forever),
+            _ => panic!("expected client command"),
+        }
+    }
+
+    #[test]
+    fn host_and_client_accept_icmp_transport() {
+        let host = Cli::try_parse_from(["rflow", "host", "--transport", "icmp"]).unwrap();
+        assert!(matches!(
+            host.command,
+            Command::Host {
+                transport: transport::HostTransportMode::Icmp,
+                ..
+            }
+        ));
+
+        let client =
+            Cli::try_parse_from(["rflow", "client", "192.168.1.50", "--transport", "icmp"])
+                .unwrap();
+        assert!(matches!(
+            client.command,
+            Command::Client {
+                transport: transport::TransportMode::Icmp,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn host_listens_on_both_transports_by_default() {
+        let host = Cli::try_parse_from(["rflow", "host"]).unwrap();
+        assert!(matches!(
+            host.command,
+            Command::Host {
+                transport: transport::HostTransportMode::Both,
+                ..
+            }
+        ));
     }
 
     #[test]

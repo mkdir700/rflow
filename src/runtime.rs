@@ -57,7 +57,8 @@ pub struct ClientConfig {
     pub identity_key: PathBuf,
     pub server_cert: Option<PathBuf>,
     pub size: Option<ScreenSize>,
-    pub retry_for: Duration,
+    /// A finite retry window, or `None` to retry every second until stopped.
+    pub retry_for: Option<Duration>,
     pub device_name: String,
     pub trust_store: PathBuf,
 }
@@ -1589,7 +1590,9 @@ async fn run_client(
         config.transport,
     )?;
     let mut trust = TrustStore::load(&config.trust_store)?;
-    let retry_deadline = tokio::time::Instant::now() + config.retry_for;
+    let retry_deadline = config
+        .retry_for
+        .map(|duration| tokio::time::Instant::now() + duration);
     let mut attempt = 0_u32;
     loop {
         attempt = attempt.saturating_add(1);
@@ -1613,17 +1616,21 @@ async fn run_client(
         .await;
         match result {
             Ok(()) => return Ok(()),
-            Err(error) if tokio::time::Instant::now() < retry_deadline => {
+            Err(error)
+                if retry_deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline) =>
+            {
                 tracing::warn!(%error, remote = %target, "client session ended; retrying");
                 events.try_send(AppEvent::PeerChanged(None));
                 publish_status(&events, RuntimeStatus::Retrying).await;
-                let remaining =
-                    retry_deadline.saturating_duration_since(tokio::time::Instant::now());
+                let delay = retry_deadline.map_or(Duration::from_secs(1), |deadline| {
+                    Duration::from_secs(1)
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                });
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(1).min(remaining)) => {}
+                    _ = tokio::time::sleep(delay) => {}
                     _ = wait_for_stop(&mut stop) => return Ok(()),
                 }
-                if tokio::time::Instant::now() >= retry_deadline {
+                if retry_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
                     return Err(error);
                 }
             }
@@ -2325,7 +2332,7 @@ mod tests {
                 identity_key: PathBuf::from("identity-key.der"),
                 server_cert: Some(PathBuf::from("server-cert.der")),
                 size: Some(ScreenSize::new(100, 100).unwrap()),
-                retry_for: Duration::from_secs(30),
+                retry_for: Some(Duration::from_secs(30)),
                 device_name: "client".to_owned(),
                 trust_store: PathBuf::from("trust.postcard"),
             }),
@@ -2468,7 +2475,7 @@ mod tests {
             identity_key: client_identity.private_key,
             server_cert: None,
             size: Some(ScreenSize::new(100, 100).unwrap()),
-            retry_for: Duration::ZERO,
+            retry_for: Some(Duration::ZERO),
             device_name: "macmini".to_owned(),
             trust_store: client_trust_path.clone(),
         };
