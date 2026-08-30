@@ -20,6 +20,13 @@ pub const EV_REL: u16 = 0x02;
 pub const REL_X: u16 = 0x00;
 pub const REL_Y: u16 = 0x01;
 
+pub fn validate_capture(paths: &[PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        anyhow::bail!("Linux connect requires at least one --device path");
+    }
+    Ok(())
+}
+
 pub fn spawn_capture(
     paths: Vec<PathBuf>,
     grab: bool,

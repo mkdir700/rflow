@@ -1,4 +1,13 @@
-use std::{ffi::c_void, path::PathBuf};
+use std::{
+    collections::HashSet,
+    ffi::c_void,
+    path::PathBuf,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::SystemTime,
+};
 
 use anyhow::{Result, bail};
 use tokio::sync::{mpsc, watch};
@@ -14,6 +23,12 @@ const REL_WHEEL: u16 = 0x08;
 
 type CGEventRef = *mut c_void;
 type CGEventSourceRef = *mut c_void;
+type CFMachPortRef = *mut c_void;
+type CFRunLoopRef = *mut c_void;
+type CFRunLoopSourceRef = *mut c_void;
+type CGEventTapProxy = *mut c_void;
+type CGEventTapCallback =
+    Option<unsafe extern "C" fn(CGEventTapProxy, u32, CGEventRef, *mut c_void) -> CGEventRef>;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -45,17 +60,255 @@ unsafe extern "C" {
         ...
     ) -> CGEventRef;
     fn CGEventPost(tap: u32, event: CGEventRef);
+    fn CGEventTapCreate(
+        tap: u32,
+        place: u32,
+        options: u32,
+        events_of_interest: u64,
+        callback: CGEventTapCallback,
+        user_info: *mut c_void,
+    ) -> CFMachPortRef;
+    fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
+    fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
     fn CFRelease(value: *const c_void);
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    static kCFRunLoopCommonModes: *const c_void;
+    fn CFMachPortCreateRunLoopSource(
+        allocator: *const c_void,
+        port: CFMachPortRef,
+        order: isize,
+    ) -> CFRunLoopSourceRef;
+    fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+    fn CFRunLoopAddSource(run_loop: CFRunLoopRef, source: CFRunLoopSourceRef, mode: *const c_void);
+    fn CFRunLoopRun();
+}
+
+const EVENT_LEFT_DOWN: u32 = 1;
+const EVENT_LEFT_UP: u32 = 2;
+const EVENT_RIGHT_DOWN: u32 = 3;
+const EVENT_RIGHT_UP: u32 = 4;
+const EVENT_MOUSE_MOVED: u32 = 5;
+const EVENT_LEFT_DRAGGED: u32 = 6;
+const EVENT_RIGHT_DRAGGED: u32 = 7;
+const EVENT_KEY_DOWN: u32 = 10;
+const EVENT_KEY_UP: u32 = 11;
+const EVENT_FLAGS_CHANGED: u32 = 12;
+const EVENT_SCROLL: u32 = 22;
+const EVENT_OTHER_DOWN: u32 = 25;
+const EVENT_OTHER_UP: u32 = 26;
+const EVENT_OTHER_DRAGGED: u32 = 27;
+
+struct CaptureContext {
+    reliable: mpsc::Sender<ReliableEvent>,
+    motion: watch::Sender<Option<Motion>>,
+    sequence: AtomicU64,
+    modifiers: Mutex<HashSet<u16>>,
+    grab: bool,
+}
+
+pub fn validate_capture(_paths: &[PathBuf]) -> Result<()> {
+    Ok(())
 }
 
 pub fn spawn_capture(
     _paths: Vec<PathBuf>,
-    _grab: bool,
-    _reliable: mpsc::Sender<ReliableEvent>,
-    _motion: watch::Sender<Option<Motion>>,
+    grab: bool,
+    reliable: mpsc::Sender<ReliableEvent>,
+    motion: watch::Sender<Option<Motion>>,
 ) -> Vec<std::thread::JoinHandle<()>> {
-    tracing::error!("macOS input capture is not implemented; use macOS as `rflow host`");
-    Vec::new()
+    vec![std::thread::spawn(move || {
+        if let Err(error) = capture_events(grab, reliable, motion) {
+            tracing::error!(%error, "macOS input capture stopped");
+        }
+    })]
+}
+
+fn capture_events(
+    grab: bool,
+    reliable: mpsc::Sender<ReliableEvent>,
+    motion: watch::Sender<Option<Motion>>,
+) -> Result<()> {
+    let context = Box::new(CaptureContext {
+        reliable,
+        motion,
+        sequence: AtomicU64::new(0),
+        modifiers: Mutex::new(HashSet::new()),
+        grab,
+    });
+    let context = Box::into_raw(context);
+    let mask = [
+        EVENT_LEFT_DOWN,
+        EVENT_LEFT_UP,
+        EVENT_RIGHT_DOWN,
+        EVENT_RIGHT_UP,
+        EVENT_MOUSE_MOVED,
+        EVENT_LEFT_DRAGGED,
+        EVENT_RIGHT_DRAGGED,
+        EVENT_KEY_DOWN,
+        EVENT_KEY_UP,
+        EVENT_FLAGS_CHANGED,
+        EVENT_SCROLL,
+        EVENT_OTHER_DOWN,
+        EVENT_OTHER_UP,
+        EVENT_OTHER_DRAGGED,
+    ]
+    .into_iter()
+    .fold(0_u64, |mask, event_type| mask | (1_u64 << event_type));
+    let tap = unsafe {
+        CGEventTapCreate(
+            0,
+            0,
+            if grab { 0 } else { 1 },
+            mask,
+            Some(event_callback),
+            context.cast(),
+        )
+    };
+    if tap.is_null() {
+        unsafe { drop(Box::from_raw(context)) };
+        bail!("create macOS event tap; grant Accessibility and Input Monitoring permissions");
+    }
+    let source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0) };
+    if source.is_null() {
+        unsafe {
+            CFRelease(tap);
+            drop(Box::from_raw(context));
+        }
+        bail!("create macOS event-tap run-loop source");
+    }
+    unsafe {
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
+        CGEventTapEnable(tap, true);
+    }
+    tracing::info!(grab, "capturing macOS keyboard and mouse input");
+    unsafe { CFRunLoopRun() };
+    unsafe {
+        CFRelease(source);
+        CFRelease(tap);
+        drop(Box::from_raw(context));
+    }
+    Ok(())
+}
+
+unsafe extern "C" fn event_callback(
+    _proxy: CGEventTapProxy,
+    event_type: u32,
+    event: CGEventRef,
+    user_info: *mut c_void,
+) -> CGEventRef {
+    let context = unsafe { &*(user_info as *const CaptureContext) };
+    handle_captured_event(context, event_type, event);
+    if context.grab {
+        std::ptr::null_mut()
+    } else {
+        event
+    }
+}
+
+fn handle_captured_event(context: &CaptureContext, event_type: u32, event: CGEventRef) {
+    match event_type {
+        EVENT_MOUSE_MOVED | EVENT_LEFT_DRAGGED | EVENT_RIGHT_DRAGGED | EVENT_OTHER_DRAGGED => {
+            let dx = event_field(event, 4) as i32;
+            let dy = event_field(event, 5) as i32;
+            if dx != 0 || dy != 0 {
+                let sequence = next_sequence(context);
+                let timestamp_micros = SystemTime::UNIX_EPOCH
+                    .elapsed()
+                    .unwrap_or_default()
+                    .as_micros() as u64;
+                context.motion.send_replace(Some(Motion {
+                    sequence,
+                    timestamp_micros,
+                    dx,
+                    dy,
+                }));
+            }
+        }
+        EVENT_LEFT_DOWN => send_key(context, 272, 1),
+        EVENT_LEFT_UP => send_key(context, 272, 0),
+        EVENT_RIGHT_DOWN => send_key(context, 273, 1),
+        EVENT_RIGHT_UP => send_key(context, 273, 0),
+        EVENT_OTHER_DOWN | EVENT_OTHER_UP => {
+            let button = match event_field(event, 3) {
+                2 => Some(274),
+                3 => Some(275),
+                4 => Some(276),
+                _ => None,
+            };
+            if let Some(button) = button {
+                send_key(context, button, i32::from(event_type == EVENT_OTHER_DOWN));
+            }
+        }
+        EVENT_KEY_DOWN | EVENT_KEY_UP => {
+            let mac_code = event_field(event, 9) as u16;
+            if let Some(code) = macos_key_to_linux(mac_code) {
+                let value = if event_type == EVENT_KEY_UP {
+                    0
+                } else if event_field(event, 8) != 0 {
+                    2
+                } else {
+                    1
+                };
+                send_key(context, code, value);
+            }
+        }
+        EVENT_FLAGS_CHANGED => {
+            let mac_code = event_field(event, 9) as u16;
+            if let Some(code) = macos_key_to_linux(mac_code) {
+                let value = {
+                    let mut modifiers = context.modifiers.lock().unwrap();
+                    if modifiers.remove(&code) {
+                        0
+                    } else {
+                        modifiers.insert(code);
+                        1
+                    }
+                };
+                send_key(context, code, value);
+            }
+        }
+        EVENT_SCROLL => {
+            let vertical = event_field(event, 11) as i32;
+            let horizontal = event_field(event, 12) as i32;
+            if vertical != 0 {
+                send_reliable(context, EV_REL, REL_WHEEL, vertical);
+            }
+            if horizontal != 0 {
+                send_reliable(context, EV_REL, REL_HWHEEL, horizontal);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn event_field(event: CGEventRef, field: u32) -> i64 {
+    unsafe { CGEventGetIntegerValueField(event, field) }
+}
+
+fn next_sequence(context: &CaptureContext) -> u64 {
+    context
+        .sequence
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
+}
+
+fn send_key(context: &CaptureContext, code: u16, value: i32) {
+    send_reliable(context, EV_KEY, code, value);
+}
+
+fn send_reliable(context: &CaptureContext, event_type: u16, code: u16, value: i32) {
+    let event = ReliableEvent::Input {
+        sequence: next_sequence(context),
+        event_type,
+        code,
+        value,
+    };
+    if let Err(error) = context.reliable.blocking_send(event) {
+        tracing::warn!(%error, "drop captured macOS input after transport closed");
+    }
 }
 
 pub struct Injector {
@@ -223,6 +476,94 @@ fn linux_key_to_macos(code: u16) -> Option<u16> {
     })
 }
 
+fn macos_key_to_linux(code: u16) -> Option<u16> {
+    Some(match code {
+        0 => 30,
+        1 => 31,
+        2 => 32,
+        3 => 33,
+        4 => 35,
+        5 => 34,
+        6 => 44,
+        7 => 45,
+        8 => 46,
+        9 => 47,
+        11 => 48,
+        12 => 16,
+        13 => 17,
+        14 => 18,
+        15 => 19,
+        16 => 21,
+        17 => 20,
+        18 => 2,
+        19 => 3,
+        20 => 4,
+        21 => 5,
+        22 => 7,
+        23 => 6,
+        24 => 13,
+        25 => 10,
+        26 => 8,
+        27 => 12,
+        28 => 9,
+        29 => 11,
+        30 => 27,
+        31 => 24,
+        32 => 22,
+        33 => 26,
+        34 => 23,
+        35 => 25,
+        36 => 28,
+        37 => 38,
+        38 => 36,
+        39 => 40,
+        40 => 37,
+        41 => 39,
+        42 => 43,
+        43 => 51,
+        44 => 53,
+        45 => 49,
+        46 => 50,
+        47 => 52,
+        48 => 15,
+        49 => 57,
+        50 => 41,
+        51 => 14,
+        53 => 1,
+        55 => 125,
+        56 => 42,
+        57 => 58,
+        58 => 56,
+        59 => 29,
+        60 => 54,
+        61 => 100,
+        62 => 97,
+        96 => 63,
+        97 => 64,
+        98 => 65,
+        99 => 61,
+        100 => 66,
+        101 => 67,
+        103 => 87,
+        109 => 68,
+        111 => 88,
+        114 => 110,
+        115 => 102,
+        116 => 104,
+        117 => 111,
+        118 => 62,
+        119 => 107,
+        120 => 60,
+        121 => 109,
+        122 => 59,
+        123 => 105,
+        124 => 106,
+        125 => 108,
+        126 => 103,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +574,13 @@ mod tests {
         assert_eq!(linux_key_to_macos(28), Some(36));
         assert_eq!(linux_key_to_macos(103), Some(126));
         assert_eq!(linux_key_to_macos(700), None);
+    }
+
+    #[test]
+    fn maps_common_macos_keys() {
+        assert_eq!(macos_key_to_linux(0), Some(30));
+        assert_eq!(macos_key_to_linux(36), Some(28));
+        assert_eq!(macos_key_to_linux(126), Some(103));
+        assert_eq!(macos_key_to_linux(700), None);
     }
 }

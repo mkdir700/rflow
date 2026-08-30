@@ -51,7 +51,8 @@ enum Command {
         target: SocketAddr,
         #[arg(long, default_value = "rflow-cert.der")]
         cert: PathBuf,
-        #[arg(long, required = true)]
+        /// Linux evdev path. Repeat for keyboard and mouse; not used on macOS.
+        #[arg(long)]
         device: Vec<PathBuf>,
         /// Exclusively grab devices. Use only after verifying the emergency stop path.
         #[arg(long)]
@@ -81,6 +82,7 @@ async fn main() -> Result<()> {
 }
 
 async fn send(to: SocketAddr, cert: PathBuf, devices: Vec<PathBuf>, grab: bool) -> Result<()> {
+    rflow::input::validate_capture(&devices)?;
     let bind_ip = if to.is_ipv4() {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
     } else {

@@ -18,6 +18,10 @@ pub const REL_Y: u16 = 0x01;
 const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
 
+pub fn validate_capture(_paths: &[PathBuf]) -> Result<()> {
+    bail!("Windows input capture is not implemented; use Windows as `rflow host`")
+}
+
 pub fn spawn_capture(
     _paths: Vec<PathBuf>,
     _grab: bool,

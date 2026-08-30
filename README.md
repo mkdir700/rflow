@@ -1,7 +1,7 @@
 # rflow
 
-`rflow` is a low-latency keyboard and mouse sharing MVP. Linux can control another Linux machine
-or a Windows/macOS host; Windows and macOS input capture are not implemented yet.
+`rflow` is a low-latency keyboard and mouse sharing MVP. Linux and macOS can act as the controlling
+computer; Linux, Windows, and macOS can act as a host. Windows input capture is not implemented.
 Pointer motion uses QUIC datagrams and a latest-value slot, so stale movement is discarded instead
 of building a queue. Keys, mouse buttons, and wheel events use a reliable ordered QUIC stream.
 
@@ -23,11 +23,11 @@ multi-receiver sessions, or support for Windows and macOS.
 cargo build --release
 ```
 
-The controlling computer currently needs Linux and must be allowed to read the selected
-`/dev/input/event*` devices. A Linux host must be allowed to write `/dev/uinput`; Windows uses the
-Win32 `SendInput` API, while macOS requires Accessibility permission for the terminal or `rflow`.
-Distribution packages commonly provide an `input` group, but group names and recommended udev
-policy vary.
+A Linux controlling computer must be allowed to read the selected `/dev/input/event*` devices. A
+Linux host must be allowed to write `/dev/uinput`. Windows uses the Win32 `SendInput` API. macOS
+capture and injection require Accessibility and Input Monitoring permission for the terminal or
+`rflow`. Distribution packages commonly provide an `input` group, but group names and recommended
+udev policy vary.
 
 ## Quick start
 
@@ -60,6 +60,13 @@ RUST_LOG=rflow=info rflow connect 192.168.1.50:24801 \
   --cert rflow-cert.der \
   --device /dev/input/by-id/your-keyboard-event-kbd \
   --device /dev/input/by-id/your-mouse-event-mouse
+```
+
+On macOS, no device paths are needed:
+
+```bash
+RUST_LOG=rflow=info rflow connect 192.168.1.50:24801 \
+  --cert rflow-cert.der
 ```
 
 Without `--grab`, events affect both machines, which is the safest first test. Once SSH or another
