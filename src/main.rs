@@ -861,11 +861,14 @@ async fn run_session(command: Command) -> Result<()> {
         std::thread::Builder::new()
             .name("rflow-terminal-prompts".to_owned())
             .spawn(move || {
-                let stdin = io::stdin();
-                let mut input = stdin.lock();
-                let stdout = io::stdout();
-                let mut output = stdout.lock();
                 while let Some(prompt) = prompt_request_rx.blocking_recv() {
+                    // Do not hold the process-wide terminal locks while waiting
+                    // for a prompt. Tracing and Ctrl-C handling run on the main
+                    // thread and must remain able to make progress while idle.
+                    let stdin = io::stdin();
+                    let mut input = stdin.lock();
+                    let stdout = io::stdout();
+                    let mut output = stdout.lock();
                     let response = match prompt {
                         TerminalPrompt::Pairing(request) => {
                             let _ = writeln!(
