@@ -9,7 +9,7 @@ use std::{
     time::SystemTime,
 };
 
-use crate::core::ScreenSize;
+use crate::{core::ScreenSize, platform::DetectedScreen};
 use anyhow::{Result, bail};
 
 pub const EV_KEY: u16 = 0x01;
@@ -83,7 +83,13 @@ unsafe extern "C" {
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
     fn CGMainDisplayID() -> u32;
+    fn CGGetActiveDisplayList(max_displays: u32, displays: *mut u32, count: *mut u32) -> i32;
     fn CGDisplayBounds(display: u32) -> CGRect;
+    fn CGDisplayPixelsWide(display: u32) -> usize;
+    fn CGDisplayVendorNumber(display: u32) -> u32;
+    fn CGDisplayModelNumber(display: u32) -> u32;
+    fn CGDisplaySerialNumber(display: u32) -> u32;
+    fn CGDisplayUnitNumber(display: u32) -> u32;
     fn CGDisplayShowCursor(display: u32) -> i32;
     fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
     fn CGWarpMouseCursorPosition(position: CGPoint) -> i32;
@@ -166,10 +172,47 @@ pub fn validate_capture(_paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-pub fn screen_size() -> Result<ScreenSize> {
-    let display = unsafe { CGMainDisplayID() };
-    let bounds = unsafe { CGDisplayBounds(display) };
-    ScreenSize::new(bounds.size.width as i32, bounds.size.height as i32).map_err(anyhow::Error::msg)
+pub fn resolve_capture_devices(overrides: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    Ok(overrides.to_vec())
+}
+
+pub fn screens() -> Result<Vec<DetectedScreen>> {
+    let mut count = 0;
+    let status = unsafe { CGGetActiveDisplayList(0, std::ptr::null_mut(), &mut count) };
+    if status != 0 || count == 0 {
+        bail!("CoreGraphics did not report any active displays (status {status})");
+    }
+    let mut displays = vec![0_u32; count as usize];
+    let status = unsafe { CGGetActiveDisplayList(count, displays.as_mut_ptr(), &mut count) };
+    if status != 0 {
+        bail!("CoreGraphics display enumeration failed (status {status})");
+    }
+    displays.truncate(count as usize);
+    let main = unsafe { CGMainDisplayID() };
+    displays
+        .into_iter()
+        .map(|display| {
+            let bounds = unsafe { CGDisplayBounds(display) };
+            let width = bounds.size.width.round() as i32;
+            let height = bounds.size.height.round() as i32;
+            let unit = unsafe { CGDisplayUnitNumber(display) };
+            let scale = unsafe { CGDisplayPixelsWide(display) } as f64 / bounds.size.width;
+            Ok(DetectedScreen {
+                stable_id: format!(
+                    "cg:{:08x}:{:08x}:{:08x}:{unit}",
+                    unsafe { CGDisplayVendorNumber(display) },
+                    unsafe { CGDisplayModelNumber(display) },
+                    unsafe { CGDisplaySerialNumber(display) },
+                ),
+                name: format!("Display {unit}"),
+                logical_size: ScreenSize::new(width, height).map_err(anyhow::Error::msg)?,
+                scale,
+                x: bounds.origin.x.round() as i32,
+                y: bounds.origin.y.round() as i32,
+                primary: display == main,
+            })
+        })
+        .collect()
 }
 
 pub fn cursor_position() -> Option<(i32, i32)> {

@@ -48,25 +48,22 @@ Windows: %APPDATA%\rflow\identity-cert.der
 ```
 
 Never copy `identity-key.der` away from its device. `rflow keygen` and the identity override options
-remain available for advanced pre-provisioning. Find stable keyboard and mouse paths:
+remain available for advanced pre-provisioning.
 
-```bash
-ls -l /dev/input/by-id/
-```
-
-Start the host with its logical cursor-coordinate size and the client's direction relative to it.
+Start the host with the client's direction relative to it. rflow detects the host's active screens,
+logical dimensions, keyboard, and pointer automatically.
 Valid directions are `top`, `top-right`, `right`, `bottom-right`, `bottom`, `bottom-left`, `left`,
-and `top-left`. With display scaling enabled, use the logical size (for example, 2560x1440 at 1.6x
-is 1600x900):
+and `top-left`:
 
 ```bash
 RUST_LOG=rflow=info rflow host \
   --bind 0.0.0.0:24801 \
-  --size 1600x900 \
-  --direction right \
-  --device /dev/input/by-id/your-keyboard-event-kbd \
-  --device /dev/input/by-id/your-mouse-event-mouse
+  --direction right
 ```
+
+On Linux, unreadable evdev devices produce a diagnostic listing the affected paths and permission
+remedy. `--device PATH` and `--size WIDTHxHEIGHT` remain temporary advanced overrides while the
+named-screen topology interface is introduced.
 
 Cardinal layouts cross a shared edge. Diagonal layouts touch at one corner, so the pointer must
 move outward across both axes together to cross; it returns through the opposite corner.

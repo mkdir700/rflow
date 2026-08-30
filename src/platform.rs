@@ -20,6 +20,17 @@ pub enum CapturedEvent {
     Motion(Motion),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetectedScreen {
+    pub stable_id: String,
+    pub name: String,
+    pub logical_size: ScreenSize,
+    pub scale: f64,
+    pub x: i32,
+    pub y: i32,
+    pub primary: bool,
+}
+
 /// Owns a platform capture session and hides its channel/protocol plumbing.
 pub struct InputCapture {
     reliable: mpsc::Receiver<CapturedEvent>,
@@ -58,6 +69,10 @@ impl InputCapture {
 
 pub fn validate_capture(paths: &[PathBuf]) -> Result<()> {
     input::validate_capture(paths)
+}
+
+pub fn resolve_capture_devices(overrides: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    input::resolve_capture_devices(overrides)
 }
 
 pub fn capture(paths: Vec<PathBuf>, grab: bool) -> Result<InputCapture> {
@@ -100,7 +115,17 @@ pub fn capture(paths: Vec<PathBuf>, grab: bool) -> Result<InputCapture> {
 }
 
 pub fn screen_size() -> Result<ScreenSize> {
-    input::screen_size()
+    let screens = screens()?;
+    screens
+        .iter()
+        .find(|screen| screen.primary)
+        .or_else(|| screens.first())
+        .map(|screen| screen.logical_size)
+        .context("platform reported no active screens")
+}
+
+pub fn screens() -> Result<Vec<DetectedScreen>> {
+    input::screens()
 }
 
 pub fn cursor_position() -> Option<(i32, i32)> {

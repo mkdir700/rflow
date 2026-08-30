@@ -10,8 +10,15 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
     MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput,
 };
+use windows_sys::Win32::{
+    Foundation::{LPARAM, RECT},
+    Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    },
+    UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
+};
 
-use crate::core::ScreenSize;
+use crate::{core::ScreenSize, platform::DetectedScreen};
 
 pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
@@ -42,8 +49,64 @@ pub fn validate_capture(_paths: &[PathBuf]) -> Result<()> {
     anyhow::bail!("Windows input capture is not implemented; use Windows as `rflow client`")
 }
 
-pub fn screen_size() -> Result<ScreenSize> {
-    anyhow::bail!("automatic screen size is unavailable on Windows; pass --size WIDTHxHEIGHT")
+pub fn resolve_capture_devices(overrides: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    Ok(overrides.to_vec())
+}
+
+pub fn screens() -> Result<Vec<DetectedScreen>> {
+    unsafe extern "system" fn collect(
+        monitor: HMONITOR,
+        _dc: HDC,
+        _rect: *mut RECT,
+        data: LPARAM,
+    ) -> i32 {
+        let screens = unsafe { &mut *(data as *mut Vec<DetectedScreen>) };
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+        if unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo as *mut MONITORINFO) } == 0 {
+            return 1;
+        }
+        let rect = info.monitorInfo.rcMonitor;
+        let name_end = info
+            .szDevice
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(info.szDevice.len());
+        let name = String::from_utf16_lossy(&info.szDevice[..name_end]);
+        let mut dpi_x = 96;
+        let mut dpi_y = 96;
+        if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) } != 0 {
+            dpi_x = 96;
+        }
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        if let Ok(logical_size) = ScreenSize::new(width, height) {
+            screens.push(DetectedScreen {
+                stable_id: format!("windows:connector:{name}"),
+                name,
+                logical_size,
+                scale: f64::from(dpi_x) / 96.0,
+                x: rect.left,
+                y: rect.top,
+                primary: info.monitorInfo.dwFlags & 1 != 0,
+            });
+        }
+        1
+    }
+
+    let mut screens = Vec::new();
+    let success = unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(collect),
+            &mut screens as *mut Vec<DetectedScreen> as LPARAM,
+        )
+    };
+    if success == 0 || screens.is_empty() {
+        anyhow::bail!("Windows did not report any active displays");
+    }
+    Ok(screens)
 }
 
 pub fn cursor_position() -> Option<(i32, i32)> {

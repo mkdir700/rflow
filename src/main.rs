@@ -51,9 +51,9 @@ enum Command {
         cert: Option<PathBuf>,
         #[arg(long = "identity-key", requires = "cert")]
         key: Option<PathBuf>,
-        /// Size of this screen in logical cursor coordinates.
+        /// Override automatic logical screen-size detection.
         #[arg(long)]
-        size: ScreenSize,
+        size: Option<ScreenSize>,
         /// Physical Linux evdev path. Repeat for keyboard and mouse.
         #[arg(long)]
         device: Vec<PathBuf>,
@@ -413,6 +413,16 @@ mod tests {
         };
         assert_eq!(cert, None);
         assert_eq!(key, None);
+    }
+
+    #[test]
+    fn host_defaults_to_automatic_screen_and_devices() {
+        let cli = Cli::try_parse_from(["rflow", "host", "--direction", "right"]).unwrap();
+        let Command::Host { size, device, .. } = cli.command else {
+            panic!("expected host command")
+        };
+        assert_eq!(size, None);
+        assert!(device.is_empty());
     }
 
     #[test]

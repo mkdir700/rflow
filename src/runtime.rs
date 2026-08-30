@@ -40,7 +40,7 @@ pub struct HostConfig {
     pub bind: SocketAddr,
     pub cert: PathBuf,
     pub key: PathBuf,
-    pub size: ScreenSize,
+    pub size: Option<ScreenSize>,
     pub devices: Vec<PathBuf>,
     pub direction: Option<ScreenDirection>,
     pub device_name: String,
@@ -560,7 +560,7 @@ async fn publish_status(events: &AppEventBus, status: RuntimeStatus) {
 }
 
 async fn run_host(
-    config: HostConfig,
+    mut config: HostConfig,
     mut stop: watch::Receiver<bool>,
     mut pairing_decisions: mpsc::Receiver<PairingDecision>,
     events: AppEventBus,
@@ -569,6 +569,9 @@ async fn run_host(
     let direction = config
         .direction
         .context("screen direction is required; pass --direction")?;
+    let size = config.size.unwrap_or(platform::screen_size()?);
+    config.size = Some(size);
+    config.devices = platform::resolve_capture_devices(&config.devices)?;
     platform::validate_capture(&config.devices)?;
     let identity = IdentityPaths {
         certificate: config.cert.clone(),
@@ -606,15 +609,8 @@ async fn run_host(
         events.send(AppEvent::PeerChanged(Some(remote))).await;
         publish_status(&events, RuntimeStatus::Connected).await;
         tracing::info!(%remote, "client connected");
-        return run_host_connection(
-            connection,
-            config.size,
-            config.devices,
-            direction,
-            stop,
-            events,
-        )
-        .await;
+        return run_host_connection(connection, size, config.devices, direction, stop, events)
+            .await;
     }
 }
 
@@ -1345,7 +1341,7 @@ mod tests {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 cert: PathBuf::from("missing-cert"),
                 key: PathBuf::from("missing-key"),
-                size: ScreenSize::new(100, 100).unwrap(),
+                size: Some(ScreenSize::new(100, 100).unwrap()),
                 devices: Vec::new(),
                 direction: None,
                 device_name: "host".to_owned(),
@@ -1396,7 +1392,7 @@ mod tests {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 cert,
                 key,
-                size: ScreenSize::new(100, 100).unwrap(),
+                size: Some(ScreenSize::new(100, 100).unwrap()),
                 devices: vec![PathBuf::from("/dev/null")],
                 direction: Some(ScreenDirection::Right),
                 device_name: "host".to_owned(),
@@ -1440,7 +1436,7 @@ mod tests {
             bind: "127.0.0.1:0".parse().unwrap(),
             cert: server_identity.certificate,
             key: server_identity.private_key,
-            size: ScreenSize::new(100, 100).unwrap(),
+            size: Some(ScreenSize::new(100, 100).unwrap()),
             devices: Vec::new(),
             direction: Some(ScreenDirection::Right),
             device_name: "linux-desktop".to_owned(),

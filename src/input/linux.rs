@@ -1,4 +1,5 @@
 use std::{
+    fs,
     path::PathBuf,
     process::Command,
     sync::mpsc as std_mpsc,
@@ -9,11 +10,12 @@ use std::{
     time::SystemTime,
 };
 
-use crate::core::ScreenSize;
-use anyhow::{Context, Result};
+use crate::{core::ScreenSize, platform::DetectedScreen};
+use anyhow::{Context, Result, bail};
 use evdev::{
     AttributeSet, Device, EventType, InputEvent, KeyCode, RelativeAxisCode, uinput::VirtualDevice,
 };
+use serde::Deserialize;
 
 pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
@@ -45,8 +47,253 @@ pub fn validate_capture(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-pub fn screen_size() -> Result<ScreenSize> {
-    anyhow::bail!("automatic screen size is unavailable on Linux; pass --size WIDTHxHEIGHT")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeviceCapabilities {
+    keyboard: bool,
+    pointer: bool,
+}
+
+pub fn resolve_capture_devices(overrides: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    if !overrides.is_empty() {
+        validate_capture(overrides)?;
+        return Ok(overrides.to_vec());
+    }
+
+    let entries = fs::read_dir("/dev/input")
+        .context("enumerate /dev/input; grant this user read access to evdev devices")?;
+    let mut selected = Vec::new();
+    let mut denied = Vec::new();
+    let mut has_keyboard = false;
+    let mut has_pointer = false;
+    for entry in entries {
+        let entry = entry.context("read /dev/input entry")?;
+        let path = entry.path();
+        if !entry.file_name().to_string_lossy().starts_with("event") {
+            continue;
+        }
+        let device = match Device::open(&path) {
+            Ok(device) => device,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                denied.push(path);
+                continue;
+            }
+            Err(error) => {
+                tracing::debug!(device = %path.display(), %error, "skip unreadable input device");
+                continue;
+            }
+        };
+        let name = device.name().unwrap_or_default();
+        if is_virtual_input_name(name) {
+            continue;
+        }
+        let capabilities = classify_device(&device);
+        if capabilities.keyboard || capabilities.pointer {
+            has_keyboard |= capabilities.keyboard;
+            has_pointer |= capabilities.pointer;
+            selected.push(path);
+        }
+    }
+    selected.sort();
+    if has_keyboard && has_pointer {
+        for path in &selected {
+            tracing::info!(device = %path.display(), "automatically selected input device");
+        }
+        return Ok(selected);
+    }
+
+    let missing = match (has_keyboard, has_pointer) {
+        (false, false) => "keyboard and relative pointer",
+        (false, true) => "keyboard",
+        (true, false) => "relative pointer",
+        (true, true) => unreachable!(),
+    };
+    if denied.is_empty() {
+        bail!(
+            "automatic evdev discovery found no usable {missing}; pass --device PATH as an advanced override"
+        );
+    }
+    let paths = denied
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "automatic evdev discovery could not read {paths}; grant the current user read access (commonly with an input-group or udev rule), then log out/in, or pass --device PATH"
+    )
+}
+
+fn classify_device(device: &Device) -> DeviceCapabilities {
+    let keys = device.supported_keys();
+    let axes = device.supported_relative_axes();
+    DeviceCapabilities {
+        keyboard: keys.is_some_and(|keys| {
+            keys.contains(KeyCode::KEY_A)
+                && keys.contains(KeyCode::KEY_Z)
+                && keys.contains(KeyCode::KEY_ENTER)
+                && keys.contains(KeyCode::KEY_SPACE)
+        }),
+        pointer: keys.is_some_and(|keys| keys.contains(KeyCode::BTN_LEFT))
+            && axes.is_some_and(|axes| {
+                axes.contains(RelativeAxisCode::REL_X) && axes.contains(RelativeAxisCode::REL_Y)
+            }),
+    }
+}
+
+fn is_virtual_input_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [
+        "rflow", "virtual", "uinput", "deskflow", "synergy", "barrier",
+    ]
+    .iter()
+    .any(|marker| name.contains(marker))
+}
+
+pub fn screens() -> Result<Vec<DetectedScreen>> {
+    hyprland_screens().or_else(|hyprland_error| {
+        xrandr_screens().with_context(|| {
+            format!(
+                "automatic screen discovery failed (Hyprland: {hyprland_error:#}); pass an explicit per-screen override"
+            )
+        })
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HyprlandMonitor {
+    name: String,
+    description: String,
+    #[serde(default)]
+    make: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    serial: String,
+    width: i32,
+    height: i32,
+    x: i32,
+    y: i32,
+    scale: f64,
+    focused: bool,
+}
+
+fn hyprland_screens() -> Result<Vec<DetectedScreen>> {
+    let output = Command::new("hyprctl")
+        .args(["-j", "monitors"])
+        .output()
+        .context("run `hyprctl -j monitors`")?;
+    if !output.status.success() {
+        bail!("`hyprctl -j monitors` exited with {}", output.status);
+    }
+    let monitors: Vec<HyprlandMonitor> =
+        serde_json::from_slice(&output.stdout).context("decode Hyprland monitor list")?;
+    let screens = monitors
+        .into_iter()
+        .map(|monitor| {
+            if !monitor.scale.is_finite() || monitor.scale <= 0.0 {
+                bail!("Hyprland reported invalid scale for {}", monitor.name);
+            }
+            let width = (f64::from(monitor.width) / monitor.scale).round() as i32;
+            let height = (f64::from(monitor.height) / monitor.scale).round() as i32;
+            Ok(DetectedScreen {
+                stable_id: hyprland_stable_id(&monitor),
+                name: if monitor.description.trim().is_empty() {
+                    monitor.name
+                } else {
+                    monitor.description
+                },
+                logical_size: ScreenSize::new(width, height).map_err(anyhow::Error::msg)?,
+                scale: monitor.scale,
+                x: monitor.x,
+                y: monitor.y,
+                primary: monitor.focused,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if screens.is_empty() {
+        bail!("Hyprland reported no active monitors");
+    }
+    Ok(screens)
+}
+
+fn hyprland_stable_id(monitor: &HyprlandMonitor) -> String {
+    if monitor.serial.trim().is_empty() {
+        format!("hyprland:connector:{}", monitor.name)
+    } else {
+        format!(
+            "hyprland:display:{}:{}:{}",
+            monitor.make.trim(),
+            monitor.model.trim(),
+            monitor.serial.trim()
+        )
+    }
+}
+
+fn xrandr_screens() -> Result<Vec<DetectedScreen>> {
+    let output = Command::new("xrandr")
+        .arg("--listactivemonitors")
+        .output()
+        .context("run `xrandr --listactivemonitors`")?;
+    if !output.status.success() {
+        bail!(
+            "`xrandr --listactivemonitors` exited with {}",
+            output.status
+        );
+    }
+    parse_xrandr_monitors(&String::from_utf8(output.stdout).context("decode xrandr output")?)
+}
+
+fn parse_xrandr_monitors(output: &str) -> Result<Vec<DetectedScreen>> {
+    let mut screens = Vec::new();
+    for line in output.lines().skip(1) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 4 {
+            continue;
+        }
+        let flags_and_name = fields[1];
+        let primary = flags_and_name.contains('*');
+        let connector = fields.last().expect("xrandr line has fields").to_string();
+        let geometry = fields[2];
+        let (width, rest) = geometry
+            .split_once('/')
+            .context("xrandr monitor width is missing")?;
+        let (_, rest) = rest
+            .split_once('x')
+            .context("xrandr monitor height is missing")?;
+        let (height, positions) = rest
+            .split_once('/')
+            .context("xrandr monitor physical height is missing")?;
+        let positions = positions
+            .find(['+', '-'])
+            .map(|index| &positions[index..])
+            .context("xrandr monitor position is missing")?;
+        let (x, y) = parse_signed_coordinates(positions)?;
+        screens.push(DetectedScreen {
+            stable_id: format!("xrandr:{connector}"),
+            name: connector,
+            logical_size: ScreenSize::new(width.parse()?, height.parse()?)
+                .map_err(anyhow::Error::msg)?,
+            scale: 1.0,
+            x,
+            y,
+            primary,
+        });
+    }
+    if screens.is_empty() {
+        bail!("xrandr reported no active monitors");
+    }
+    if !screens.iter().any(|screen| screen.primary) {
+        screens[0].primary = true;
+    }
+    Ok(screens)
+}
+
+fn parse_signed_coordinates(value: &str) -> Result<(i32, i32)> {
+    let split = value[1..]
+        .find(['+', '-'])
+        .map(|index| index + 1)
+        .context("monitor position needs two coordinates")?;
+    Ok((value[..split].parse()?, value[split..].parse()?))
 }
 
 pub fn cursor_position() -> Option<(i32, i32)> {
@@ -232,5 +479,33 @@ impl Injector {
         self.device
             .emit(&[InputEvent::new(event_type, code, value)])
             .context("inject input event")
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn virtual_input_devices_are_excluded_without_rejecting_physical_names() {
+        assert!(is_virtual_input_name("rflow virtual keyboard"));
+        assert!(is_virtual_input_name("Deskflow pointer"));
+        assert!(!is_virtual_input_name("Logitech USB Receiver"));
+    }
+
+    #[test]
+    fn xrandr_monitors_preserve_each_logical_screen_and_signed_position() {
+        let screens = parse_xrandr_monitors(
+            "Monitors: 2\n 0: +*DP-1 1920/509x1080/286+0+0  DP-1\n 1: +HDMI-1 2560/600x1440/340-2560+120  HDMI-1\n",
+        )
+        .unwrap();
+        assert_eq!(screens.len(), 2);
+        assert_eq!(
+            screens[0].logical_size,
+            ScreenSize::new(1920, 1080).unwrap()
+        );
+        assert!(screens[0].primary);
+        assert_eq!((screens[1].x, screens[1].y), (-2560, 120));
+        assert_eq!(screens[1].stable_id, "xrandr:HDMI-1");
     }
 }
