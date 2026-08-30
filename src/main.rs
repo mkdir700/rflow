@@ -296,7 +296,8 @@ async fn client(
             Ok(()) => return Ok(()),
             Err(error) if tokio::time::Instant::now() < retry_deadline => {
                 tracing::warn!(%error, remote = %to, "client session ended; retrying");
-                let remaining = retry_deadline.saturating_duration_since(tokio::time::Instant::now());
+                let remaining =
+                    retry_deadline.saturating_duration_since(tokio::time::Instant::now());
                 tokio::time::sleep(Duration::from_secs(1).min(remaining)).await;
                 if tokio::time::Instant::now() >= retry_deadline {
                     return Err(error);
