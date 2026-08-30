@@ -364,8 +364,8 @@ pub struct Injector {
 impl Injector {
     pub fn new() -> Result<Self> {
         if !unsafe { AXIsProcessTrusted() } {
-            bail!(
-                "macOS Accessibility permission is required to inject input; enable the terminal or rflow in System Settings > Privacy & Security > Accessibility, then restart it"
+            tracing::warn!(
+                "macOS does not report this process as Accessibility-trusted; input injection may be ignored"
             );
         }
         Ok(Self::default())

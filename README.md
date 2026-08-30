@@ -32,8 +32,8 @@ commonly provide an `input` group, but group names and recommended udev policy v
 
 On macOS, enable the actual process launching `rflow` under **System Settings → Privacy &
 Security → Accessibility**, then restart that process. If you run the binary from Terminal or
-iTerm, authorize that terminal application. A macOS client refuses to inject input when this
-permission is missing instead of connecting in a partially working state.
+iTerm, authorize that terminal application. rflow logs a warning when macOS does not report the
+process as trusted; macOS may still distinguish the responsible terminal or launcher process.
 
 ## Quick start
 
