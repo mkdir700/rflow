@@ -289,12 +289,16 @@ mod tests {
         );
         assert_eq!(
             session.handle(SessionEvent::PhysicalMotion(motion(1, 3, 0))),
+            vec![SessionEffect::InjectLocalMotion { dx: 3, dy: 0 }]
+        );
+        assert_eq!(
+            session.handle(SessionEvent::PhysicalMotion(motion(2, 1, 0))),
             vec![
                 SessionEffect::InjectLocal(InputEvent::Key {
                     key: Key(30),
                     state: ButtonState::Released,
                 }),
-                SessionEffect::EnterRemote { x: 2, y: 100 },
+                SessionEffect::EnterRemote { x: 1, y: 100 },
                 SessionEffect::SendRemote(key),
                 SessionEffect::ControlChanged(ControlTarget::Remote),
             ]
@@ -337,7 +341,8 @@ mod tests {
             state: ButtonState::Pressed,
         };
         session.handle(SessionEvent::PhysicalInput(down));
-        let effects = session.handle(SessionEvent::PhysicalMotion(motion(1, 3, 0)));
+        session.handle(SessionEvent::PhysicalMotion(motion(1, 3, 0)));
+        let effects = session.handle(SessionEvent::PhysicalMotion(motion(2, 1, 0)));
         assert_eq!(
             effects[0],
             SessionEffect::InjectLocal(InputEvent::Button {
@@ -362,8 +367,10 @@ mod tests {
         };
         session.handle(SessionEvent::PhysicalInput(down));
         session.handle(SessionEvent::PhysicalMotion(motion(1, 3, 0)));
+        session.handle(SessionEvent::PhysicalMotion(motion(2, 1, 0)));
+        session.handle(SessionEvent::PhysicalMotion(motion(3, -3, 0)));
         assert_eq!(
-            session.handle(SessionEvent::PhysicalMotion(motion(2, -3, 0))),
+            session.handle(SessionEvent::PhysicalMotion(motion(4, -1, 0))),
             vec![
                 SessionEffect::ReleaseRemote,
                 SessionEffect::SetLocalCursor { x: 98, y: 50 },
@@ -419,6 +426,7 @@ mod tests {
             state: ButtonState::Pressed,
         }));
         session.handle(SessionEvent::PhysicalMotion(motion(1, 3, 0)));
+        session.handle(SessionEvent::PhysicalMotion(motion(2, 1, 0)));
         assert_eq!(
             session.handle(SessionEvent::PeerDisconnected),
             vec![SessionEffect::ReleaseRemote]
@@ -481,6 +489,10 @@ mod tests {
 
         assert_eq!(
             session.handle(SessionEvent::PhysicalMotion(motion(1, -3, 0))),
+            vec![SessionEffect::InjectLocalMotion { dx: -3, dy: 0 }]
+        );
+        assert_eq!(
+            session.handle(SessionEvent::PhysicalMotion(motion(2, -1, 0))),
             vec![
                 SessionEffect::InjectLocal(InputEvent::Key {
                     key: Key(30),
