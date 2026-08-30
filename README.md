@@ -114,6 +114,7 @@ List the remembered devices or explicitly remove one with:
 rflow peers
 rflow peers forget macmini
 rflow peers forget macmini --yes  # non-interactive scripts
+rflow peers forget --all --yes    # remove every trusted device
 ```
 
 Forgetting a device removes its trust and endpoint bindings. The next connection must be paired

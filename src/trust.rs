@@ -276,6 +276,18 @@ impl TrustStore {
         Ok(true)
     }
 
+    pub fn forget_all(&mut self) -> Result<usize> {
+        let count = self.database.peers.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        let mut candidate = self.database.clone();
+        candidate.peers.clear();
+        candidate.endpoints.clear();
+        self.commit(candidate)?;
+        Ok(count)
+    }
+
     fn commit(&mut self, candidate: TrustDatabase) -> Result<()> {
         let bytes = postcard::to_allocvec(&candidate).context("encode trusted peer store")?;
         if let Some(directory) = self.path.parent() {
@@ -425,5 +437,29 @@ mod tests {
         trust.bind_endpoint("desktop:24801", first).unwrap();
         let error = trust.bind_endpoint("desktop:24801", second).unwrap_err();
         assert!(error.to_string().contains("forget that device"));
+    }
+
+    #[test]
+    fn forgetting_all_peers_removes_devices_and_endpoint_bindings_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trust");
+        let mut trust = TrustStore::load(&path).unwrap();
+        let first = trust.remember("first", b"first", 1).unwrap();
+        let second = trust.remember("second", b"second", 1).unwrap();
+        trust.bind_endpoint("first:24801", first).unwrap();
+        trust.bind_endpoint("second:24801", second).unwrap();
+
+        assert_eq!(trust.forget_all().unwrap(), 2);
+
+        let trust = TrustStore::load(&path).unwrap();
+        assert!(trust.peers().is_empty());
+        assert!(matches!(
+            trust.verify_endpoint("first:24801", b"first"),
+            VerifyPeer::Unknown(_)
+        ));
+        assert!(matches!(
+            trust.verify_endpoint("second:24801", b"second"),
+            VerifyPeer::Unknown(_)
+        ));
     }
 }

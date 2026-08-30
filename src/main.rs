@@ -177,7 +177,11 @@ enum PeersCommand {
     Reject { request_id: PairingRequestId },
     /// Remove a trusted device and its endpoint bindings.
     Forget {
-        device: String,
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        device: Option<String>,
+        /// Remove every trusted device and endpoint binding.
+        #[arg(long)]
+        all: bool,
         /// Skip the interactive confirmation.
         #[arg(long)]
         yes: bool,
@@ -549,11 +553,32 @@ async fn run_peers(command: Option<PeersCommand>) -> Result<()> {
             submit_pairing_decision(request_id, false).await?;
             println!("Rejected {request_id}.");
         }
-        Some(PeersCommand::Forget { device, yes }) => {
+        Some(PeersCommand::Forget { device, all, yes }) => {
             let mut trust = rflow::trust::TrustStore::platform_default()?;
-            let device_id = trust.resolve_peer(&device)?;
+            let peers: Vec<_> = if all {
+                trust
+                    .peers()
+                    .iter()
+                    .map(|peer| (peer.device_id, peer.display_name.clone()))
+                    .collect()
+            } else {
+                let device = device.as_deref().expect("clap requires a device or --all");
+                let device_id = trust.resolve_peer(device)?;
+                vec![(device_id, device.to_owned())]
+            };
+            if peers.is_empty() {
+                println!("No trusted devices.");
+                return Ok(());
+            }
             if !yes {
-                print!("Forget trusted device {device} ({device_id})? [y/N] ");
+                if all {
+                    print!("Forget all {} trusted devices? [y/N] ", peers.len());
+                } else {
+                    print!(
+                        "Forget trusted device {} ({})? [y/N] ",
+                        peers[0].1, peers[0].0
+                    );
+                }
                 io::stdout().flush()?;
                 let mut answer = String::new();
                 let confirmed = io::stdin().read_line(&mut answer).is_ok()
@@ -563,17 +588,31 @@ async fn run_peers(command: Option<PeersCommand>) -> Result<()> {
                     return Ok(());
                 }
             }
-            trust.forget(device_id)?;
-            if let Ok(response) = management_request(
-                default_endpoint_path()?,
-                ManagementRequest::ForgetPeer(device_id.to_string()),
-            )
-            .await
-                && let ManagementResponse::Error(message) = response
-            {
-                bail!("peer was forgotten, but the running host rejected the update: {message}");
+            if all {
+                trust.forget_all()?;
+            } else {
+                trust.forget(peers[0].0)?;
             }
-            println!("Forgot {device}.");
+            let endpoint = default_endpoint_path()?;
+            let mut rejected = None;
+            for (device_id, _) in &peers {
+                if let Ok(ManagementResponse::Error(message)) = management_request(
+                    &endpoint,
+                    ManagementRequest::ForgetPeer(device_id.to_string()),
+                )
+                .await
+                {
+                    rejected.get_or_insert(message);
+                }
+            }
+            if let Some(message) = rejected {
+                bail!("peers were forgotten, but the running host rejected an update: {message}");
+            }
+            if all {
+                println!("Forgot {} trusted devices.", peers.len());
+            } else {
+                println!("Forgot {}.", peers[0].1);
+            }
         }
     }
     Ok(())
@@ -1124,13 +1163,23 @@ mod tests {
     fn peers_forget_requires_an_explicit_device_and_supports_yes() {
         let cli = Cli::try_parse_from(["rflow", "peers", "forget", "macmini", "--yes"]).unwrap();
         let Command::Peers {
-            command: Some(PeersCommand::Forget { device, yes }),
+            command: Some(PeersCommand::Forget { device, all, yes }),
         } = cli.command
         else {
             panic!("expected peers forget command")
         };
-        assert_eq!(device, "macmini");
+        assert_eq!(device.as_deref(), Some("macmini"));
+        assert!(!all);
         assert!(yes);
+    }
+
+    #[test]
+    fn peers_forget_all_is_explicit_and_mutually_exclusive_with_a_device() {
+        assert!(Cli::try_parse_from(["rflow", "peers", "forget", "--all", "--yes"]).is_ok());
+        assert!(Cli::try_parse_from(["rflow", "peers", "forget", "--yes"]).is_err());
+        assert!(
+            Cli::try_parse_from(["rflow", "peers", "forget", "macmini", "--all", "--yes"]).is_err()
+        );
     }
 
     #[test]
