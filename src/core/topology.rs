@@ -101,7 +101,7 @@ pub enum TopologyRoute {
     },
 }
 
-const EDGE_BARRIER_DISTANCE: i32 = 4;
+const EDGE_BARRIER_DISTANCE: i32 = 8;
 
 struct EdgeBarrier<K> {
     edge: Option<K>,
@@ -755,7 +755,7 @@ mod tests {
 
         assert_eq!(router.route_motion(5, 0), Route::Local { dx: 5, dy: 0 });
         assert_eq!(
-            router.route_motion(4, 0),
+            router.route_motion(8, 0),
             Route::EnterRemote { x: 1, y: 720 }
         );
         assert_eq!(router.active(), ActiveScreen::Remote);
@@ -769,7 +769,7 @@ mod tests {
         assert_eq!(router.route_motion(5, 0), Route::Local { dx: 5, dy: 0 });
         assert_eq!(router.active(), ActiveScreen::Local);
         assert_eq!(
-            router.route_motion(4, 0),
+            router.route_motion(8, 0),
             Route::EnterRemote { x: 1, y: 720 }
         );
     }
@@ -783,7 +783,7 @@ mod tests {
             assert_eq!(router.route_motion(5, 0), Route::Local { dx: 5, dy: 0 });
         }
 
-        for _ in 0..3 {
+        for _ in 0..7 {
             assert_eq!(
                 high_report_rate.route_motion(1, 0),
                 Route::Local { dx: 1, dy: 0 }
@@ -794,7 +794,7 @@ mod tests {
             Route::EnterRemote { x: 1, y: 720 }
         );
         assert_eq!(
-            low_report_rate.route_motion(4, 0),
+            low_report_rate.route_motion(8, 0),
             Route::EnterRemote { x: 1, y: 720 }
         );
     }
@@ -804,10 +804,10 @@ mod tests {
         let mut router = router();
         router.set_local_position(1919, 540);
 
-        assert_eq!(router.route_motion(2, 0), Route::Local { dx: 2, dy: 0 });
+        assert_eq!(router.route_motion(6, 0), Route::Local { dx: 6, dy: 0 });
         assert_eq!(router.route_motion(-1, 0), Route::Local { dx: -1, dy: 0 });
         assert_eq!(router.route_motion(1, 0), Route::Local { dx: 1, dy: 0 });
-        assert_eq!(router.route_motion(2, 0), Route::Local { dx: 2, dy: 0 });
+        assert_eq!(router.route_motion(6, 0), Route::Local { dx: 6, dy: 0 });
         assert_eq!(
             router.route_motion(2, 0),
             Route::EnterRemote { x: 1, y: 720 }
@@ -825,11 +825,11 @@ mod tests {
 
         assert_eq!(router.route_motion(-3, 0), Route::Local { dx: -3, dy: 0 });
         assert_eq!(
-            router.route_motion(-4, 0),
+            router.route_motion(-8, 0),
             Route::EnterRemote { x: 198, y: 50 }
         );
         assert_eq!(router.route_motion(3, 0), Route::Remote { dx: 3, dy: 0 });
-        assert_eq!(router.route_motion(4, 0), Route::EnterLocal { x: 1, y: 25 });
+        assert_eq!(router.route_motion(8, 0), Route::EnterLocal { x: 1, y: 25 });
     }
 
     #[test]
@@ -843,11 +843,11 @@ mod tests {
 
         assert_eq!(router.route_motion(0, -3), Route::Local { dx: 0, dy: -3 });
         assert_eq!(
-            router.route_motion(0, -4),
+            router.route_motion(0, -8),
             Route::EnterRemote { x: 50, y: 198 }
         );
         assert_eq!(router.route_motion(0, 3), Route::Remote { dx: 0, dy: 3 });
-        assert_eq!(router.route_motion(0, 4), Route::EnterLocal { x: 25, y: 1 });
+        assert_eq!(router.route_motion(0, 8), Route::EnterLocal { x: 25, y: 1 });
     }
 
     #[test]
@@ -862,12 +862,12 @@ mod tests {
         assert_eq!(router.route_motion(3, 0), Route::Local { dx: 3, dy: 0 });
         assert_eq!(router.route_motion(3, -3), Route::Local { dx: 3, dy: -3 });
         assert_eq!(
-            router.route_motion(4, -4),
+            router.route_motion(8, -8),
             Route::EnterRemote { x: 1, y: 198 }
         );
         assert_eq!(router.route_motion(-3, 3), Route::Remote { dx: -3, dy: 3 });
         assert_eq!(
-            router.route_motion(-4, 4),
+            router.route_motion(-8, 8),
             Route::EnterLocal { x: 98, y: 1 }
         );
     }
@@ -923,7 +923,7 @@ mod tests {
                 }
             );
             assert_eq!(
-                router.route_motion(outbound.0.signum() * 4, outbound.1.signum() * 4),
+                router.route_motion(outbound.0.signum() * 8, outbound.1.signum() * 8),
                 entered
             );
             assert_eq!(
@@ -934,7 +934,7 @@ mod tests {
                 }
             );
             assert_eq!(
-                router.route_motion(inbound.0.signum() * 4, inbound.1.signum() * 4),
+                router.route_motion(inbound.0.signum() * 8, inbound.1.signum() * 8),
                 returned
             );
         }
@@ -945,11 +945,11 @@ mod tests {
         let mut router = router();
         router.set_local_position(1918, 540);
         router.route_motion(5, 0);
-        router.route_motion(4, 0);
+        router.route_motion(8, 0);
 
         assert_eq!(router.route_motion(-5, 0), Route::Remote { dx: -5, dy: 0 });
         assert_eq!(
-            router.route_motion(-4, 0),
+            router.route_motion(-8, 0),
             Route::EnterLocal { x: 1918, y: 540 }
         );
         assert_eq!(router.active(), ActiveScreen::Local);
@@ -961,7 +961,7 @@ mod tests {
         assert_eq!(router.route_motion(10, -4), Route::Local { dx: 10, dy: -4 });
         router.set_local_position(1918, 540);
         router.route_motion(5, 0);
-        router.route_motion(4, 0);
+        router.route_motion(8, 0);
         assert_eq!(router.route_motion(8, 3), Route::Remote { dx: 8, dy: 3 });
     }
 
@@ -1088,14 +1088,14 @@ mod tests {
             TopologyRoute::Stay { .. }
         ));
         assert!(
-            matches!(router.route_motion(4, 0), TopologyRoute::Cross { screen_id: ScreenId(ref id), .. } if id == "b")
+            matches!(router.route_motion(8, 0), TopologyRoute::Cross { screen_id: ScreenId(ref id), .. } if id == "b")
         );
         assert!(matches!(
             router.route_motion(100, 0),
             TopologyRoute::Stay { .. }
         ));
         assert!(
-            matches!(router.route_motion(4, 0), TopologyRoute::Cross { screen_id: ScreenId(ref id), .. } if id == "c")
+            matches!(router.route_motion(8, 0), TopologyRoute::Cross { screen_id: ScreenId(ref id), .. } if id == "c")
         );
         assert_eq!(router.active_screen(), &ScreenId("c".into()));
     }
