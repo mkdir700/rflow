@@ -201,6 +201,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(runtime_log_filter(cli.verbose))
         .init();
+    tracing::debug!(verbosity = cli.verbose, "runtime logging enabled");
     match cli.command {
         Command::Keygen { cert, key, force } => {
             transport::generate_identity(&cert, &key, force)?;
