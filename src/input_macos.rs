@@ -373,6 +373,7 @@ fn send_reliable(context: &CaptureContext, event_type: u16, code: u16, value: i3
 #[derive(Default)]
 pub struct Injector {
     modifiers: HashSet<u16>,
+    mouse_buttons: HashSet<u16>,
 }
 
 impl Injector {
@@ -387,13 +388,14 @@ impl Injector {
 
     pub fn emit_motion(&mut self, dx: i32, dy: i32) -> Result<()> {
         let position = self.pointer_position()?;
+        let (event_type, button) = drag_event(&self.mouse_buttons);
         self.post_mouse(
-            5,
+            event_type,
             CGPoint {
                 x: position.x + dx as f64,
                 y: position.y + dy as f64,
             },
-            0,
+            button,
         )
     }
 
@@ -429,11 +431,17 @@ impl Injector {
 
     fn emit_key(&mut self, code: u16, value: i32) -> Result<()> {
         if let Some((down, up, button)) = mouse_button(code) {
-            return self.post_mouse(
+            let result = self.post_mouse(
                 if value == 0 { up } else { down },
                 self.pointer_position()?,
                 button,
             );
+            if value == 0 {
+                self.mouse_buttons.remove(&code);
+            } else {
+                self.mouse_buttons.insert(code);
+            }
+            return result;
         }
         let Some(keycode) = linux_key_to_macos(code) else {
             tracing::debug!(code, "ignoring unmapped Linux key code on macOS");
@@ -571,6 +579,18 @@ fn mouse_button(code: u16) -> Option<(u32, u32, u32)> {
         275 => Some((25, 26, 3)),
         276 => Some((25, 26, 4)),
         _ => None,
+    }
+}
+
+fn drag_event(buttons: &HashSet<u16>) -> (u32, u32) {
+    if buttons.contains(&272) {
+        (EVENT_LEFT_DRAGGED, 0)
+    } else if buttons.contains(&273) {
+        (EVENT_RIGHT_DRAGGED, 1)
+    } else if let Some(code) = (274..=276).find(|code| buttons.contains(code)) {
+        (EVENT_OTHER_DRAGGED, u32::from(code - 272))
+    } else {
+        (EVENT_MOUSE_MOVED, 0)
     }
 }
 
@@ -766,5 +786,13 @@ mod tests {
         assert_eq!(modifier_flag(61), Some(FLAG_OPTION));
         assert_eq!(modifier_flag(62), Some(FLAG_CONTROL));
         assert_eq!(modifier_flag(0), None);
+    }
+
+    #[test]
+    fn selects_drag_event_from_pressed_mouse_button() {
+        assert_eq!(drag_event(&HashSet::new()), (EVENT_MOUSE_MOVED, 0));
+        assert_eq!(drag_event(&HashSet::from([272])), (EVENT_LEFT_DRAGGED, 0));
+        assert_eq!(drag_event(&HashSet::from([273])), (EVENT_RIGHT_DRAGGED, 1));
+        assert_eq!(drag_event(&HashSet::from([275])), (EVENT_OTHER_DRAGGED, 3));
     }
 }

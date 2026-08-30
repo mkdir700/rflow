@@ -68,8 +68,13 @@ On the client screen, connect to the host:
 
 ```bash
 RUST_LOG=rflow=info rflow client 192.168.1.50:24801 \
-  --cert rflow-cert.der
+  --cert rflow-cert.der \
+  --retry-for 120
 ```
+
+`--retry-for` keeps retrying initial connections and reconnecting dropped sessions for the given
+number of seconds from client startup. This is useful when one Bluetooth keyboard and mouse must be
+switched back to the Linux host before its input devices become available.
 
 The host grabs the selected physical devices and reinjects them locally while its own screen is
 active. Keep SSH or another independent input device available during MVP testing. When the cursor

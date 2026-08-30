@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use quinn::{Connection, RecvStream, SendStream};
+use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use rflow::{
     input::{Injector, spawn_capture},
     protocol::{
@@ -64,6 +64,9 @@ enum Command {
         /// Override automatic screen-size detection.
         #[arg(long)]
         size: Option<ScreenSize>,
+        /// Keep reconnecting for this many seconds after startup.
+        #[arg(long, default_value_t = 0)]
+        retry_for: u64,
     },
 }
 
@@ -86,7 +89,12 @@ async fn main() -> Result<()> {
             device,
             right,
         } => host(bind, cert, key, size, device, right).await,
-        Command::Client { target, cert, size } => client(target, cert, size).await,
+        Command::Client {
+            target,
+            cert,
+            size,
+            retry_for,
+        } => client(target, cert, size, Duration::from_secs(retry_for)).await,
     }
 }
 
@@ -266,7 +274,12 @@ async fn replay_held_inputs(stream: &mut SendStream, pressed: &PressedState) -> 
     Ok(())
 }
 
-async fn client(to: SocketAddr, cert: PathBuf, requested_size: Option<ScreenSize>) -> Result<()> {
+async fn client(
+    to: SocketAddr,
+    cert: PathBuf,
+    requested_size: Option<ScreenSize>,
+    retry_for: Duration,
+) -> Result<()> {
     let size = match requested_size {
         Some(size) => size,
         None => rflow::input::screen_size()?,
@@ -277,7 +290,25 @@ async fn client(to: SocketAddr, cert: PathBuf, requested_size: Option<ScreenSize
         IpAddr::V6(Ipv6Addr::UNSPECIFIED)
     };
     let endpoint = transport::client_endpoint(SocketAddr::new(bind_ip, 0), &cert)?;
-    let connection = transport::connect(&endpoint, to).await?;
+    let retry_deadline = tokio::time::Instant::now() + retry_for;
+    loop {
+        match client_once(&endpoint, to, size).await {
+            Ok(()) => return Ok(()),
+            Err(error) if tokio::time::Instant::now() < retry_deadline => {
+                tracing::warn!(%error, remote = %to, "client session ended; retrying");
+                let remaining = retry_deadline.saturating_duration_since(tokio::time::Instant::now());
+                tokio::time::sleep(Duration::from_secs(1).min(remaining)).await;
+                if tokio::time::Instant::now() >= retry_deadline {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn client_once(endpoint: &Endpoint, to: SocketAddr, size: ScreenSize) -> Result<()> {
+    let connection = transport::connect(endpoint, to).await?;
     tracing::info!(remote = %to, width = size.width, height = size.height, "connected to host");
 
     let mut metadata = connection
@@ -418,10 +449,32 @@ mod tests {
     fn client_uses_positional_host() {
         let cli = Cli::try_parse_from(["rflow", "client", "192.168.1.50:24801"]).unwrap();
         match cli.command {
-            Command::Client { target, size, .. } => {
+            Command::Client {
+                target,
+                size,
+                retry_for,
+                ..
+            } => {
                 assert_eq!(target, "192.168.1.50:24801".parse().unwrap());
                 assert_eq!(size, None);
+                assert_eq!(retry_for, 0);
             }
+            _ => panic!("expected client command"),
+        }
+    }
+
+    #[test]
+    fn client_parses_retry_window() {
+        let cli = Cli::try_parse_from([
+            "rflow",
+            "client",
+            "192.168.1.50:24801",
+            "--retry-for",
+            "120",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Client { retry_for, .. } => assert_eq!(retry_for, 120),
             _ => panic!("expected client command"),
         }
     }
