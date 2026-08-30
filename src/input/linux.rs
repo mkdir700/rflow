@@ -455,9 +455,10 @@ impl Injector {
             let source = Device::open(path)
                 .with_context(|| format!("inspect input device {}", path.display()))?;
             let name = source.name().unwrap_or("rflow input");
+            let hypr_name = hyprland_device_name(name);
             if let Some(profile) = hypr_before
                 .as_ref()
-                .and_then(|keyboards| keyboards.iter().find(|keyboard| keyboard.name == name))
+                .and_then(|keyboards| keyboards.iter().find(|keyboard| keyboard.name == hypr_name))
             {
                 keyboard_profiles.push(profile.clone());
             }
@@ -647,6 +648,20 @@ fn virtual_device_name_matches(candidate: &str, physical: &str) -> bool {
             })
 }
 
+fn hyprland_device_name(evdev_name: &str) -> String {
+    evdev_name
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|character| {
+            if character.is_whitespace() {
+                '-'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 fn apply_hypr_keyboard_profile(name: &str, profile: &HyprKeyboard) {
     let lua = hypr_keyboard_lua(name, profile);
     match Command::new("hyprctl").args(["eval", &lua]).output() {
@@ -764,6 +779,14 @@ mod discovery_tests {
             "hhkb-hybrid_3-keyboard-pro-1",
             "hhkb-hybrid_3-keyboard"
         ));
+    }
+
+    #[test]
+    fn evdev_names_are_normalized_the_same_way_as_hyprland_device_names() {
+        assert_eq!(
+            hyprland_device_name("HHKB-Hybrid_3 Keyboard"),
+            "hhkb-hybrid_3-keyboard"
+        );
     }
 
     #[test]
