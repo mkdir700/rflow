@@ -24,16 +24,61 @@ pub fn render_json(topology: &ScreenTopology) -> Result<String> {
 
 pub fn render_text(topology: &ScreenTopology) -> String {
     if topology.screens.is_empty() {
-        return "Screen layout\n\nNo screens are available.".to_owned();
+        return format!(
+            "Screen layout · revision {}\n\nNo screens are available.",
+            topology.revision
+        );
     }
-    let (diagram, complete) = render_diagram(topology);
-    let mut output = format!("Screen layout\n\n{diagram}\n");
-    if !complete {
-        output.push_str("\nLayout contains disconnected nodes or conflicting coordinates.\n");
+    let is_linked = |screen: &ScreenNode| {
+        topology.links.iter().any(|link| {
+            link.from.screen_id == screen.screen_id || link.to.screen_id == screen.screen_id
+        })
+    };
+    let visible: Vec<_> = topology
+        .screens
+        .iter()
+        .filter(|screen| screen.online || screen.this_device || is_linked(screen))
+        .collect();
+    let hidden = topology.screens.len().saturating_sub(visible.len());
+    let mut output = format!(
+        "Screen layout · revision {}\n\nScreens\n",
+        topology.revision
+    );
+    for screen in visible {
+        let size = screen.effective_size();
+        output.push_str(&format!(
+            "  {}{} · {} · {}×{} · {}{}\n",
+            screen.device_name,
+            if screen.this_device { " ★" } else { "" },
+            screen.name,
+            size.width,
+            size.height,
+            if screen.online { "online" } else { "offline" },
+            if is_linked(screen) { " · placed" } else { "" },
+        ));
     }
+
+    if !topology.links.is_empty() {
+        let linked_topology = ScreenTopology {
+            revision: topology.revision,
+            screens: topology
+                .screens
+                .iter()
+                .filter(|screen| is_linked(screen))
+                .cloned()
+                .collect(),
+            links: topology.links.clone(),
+        };
+        let (diagram, complete) = render_diagram(&linked_topology);
+        output.push_str(&format!("\n{diagram}\n"));
+        if !complete {
+            output.push_str("\nLinked screens have conflicting coordinates.\n");
+        }
+    }
+
     output.push_str("\nLinks\n");
     if topology.links.is_empty() {
-        output.push_str("  No screen links configured.\n");
+        output.push_str("  None\n");
     } else {
         for link in &topology.links {
             output.push_str(&format!(
@@ -42,7 +87,11 @@ pub fn render_text(topology: &ScreenTopology) -> String {
             ));
         }
     }
-    output.push_str("\n★ This device");
+    if hidden > 0 {
+        output.push_str(&format!(
+            "\n{hidden} offline, unplaced screens hidden; run `rflow layout screens` to show all."
+        ));
+    }
     output
 }
 
@@ -200,7 +249,25 @@ mod tests {
     fn text_marks_local_device_and_dimensions() {
         let rendered = render_text(&topology());
         assert!(rendered.contains("linux-desktop ★"));
-        assert!(rendered.contains("DP-1 2560×1440"));
+        assert!(rendered.contains("DP-1 · 2560×1440"));
+    }
+
+    #[test]
+    fn text_hides_offline_unplaced_history_from_the_default_view() {
+        let mut topology = topology();
+        for index in 0..8 {
+            let mut stale = topology.screens[0].clone();
+            stale.screen_id = ScreenId(format!("stale-{index}"));
+            stale.online = false;
+            stale.this_device = false;
+            topology.screens.push(stale);
+        }
+
+        let rendered = render_text(&topology);
+
+        assert!(!rendered.contains('┌'));
+        assert_eq!(rendered.matches("DP-1").count(), 1);
+        assert!(rendered.contains("8 offline, unplaced screens hidden"));
     }
 
     #[test]
