@@ -38,6 +38,20 @@ struct CGPoint {
     y: f64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGSize {
+    width: f64,
+    height: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGRect {
+    origin: CGPoint,
+    size: CGSize,
+}
+
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn CGEventSourceCreate(state_id: i32) -> CGEventSourceRef;
@@ -72,8 +86,7 @@ unsafe extern "C" {
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
     fn CGMainDisplayID() -> u32;
-    fn CGDisplayPixelsWide(display: u32) -> usize;
-    fn CGDisplayPixelsHigh(display: u32) -> usize;
+    fn CGDisplayBounds(display: u32) -> CGRect;
     fn CFRelease(value: *const c_void);
 }
 
@@ -119,9 +132,8 @@ pub fn validate_capture(_paths: &[PathBuf]) -> Result<()> {
 
 pub fn screen_size() -> Result<ScreenSize> {
     let display = unsafe { CGMainDisplayID() };
-    let width = unsafe { CGDisplayPixelsWide(display) };
-    let height = unsafe { CGDisplayPixelsHigh(display) };
-    ScreenSize::new(width as i32, height as i32).map_err(anyhow::Error::msg)
+    let bounds = unsafe { CGDisplayBounds(display) };
+    ScreenSize::new(bounds.size.width as i32, bounds.size.height as i32).map_err(anyhow::Error::msg)
 }
 
 pub fn cursor_position() -> Option<(i32, i32)> {

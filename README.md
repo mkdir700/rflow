@@ -45,12 +45,13 @@ the host. Find stable keyboard and mouse paths:
 ls -l /dev/input/by-id/
 ```
 
-Start the host with its physical screen size and the single client on its right:
+Start the host with its logical cursor-coordinate size and the single client on its right. With
+display scaling enabled, use the logical size (for example, 2560x1440 at 1.6x is 1600x900):
 
 ```bash
 RUST_LOG=rflow=info rflow host \
   --bind 0.0.0.0:24801 \
-  --size 2560x1440 \
+  --size 1600x900 \
   --right \
   --cert rflow-cert.der \
   --key rflow-key.der \

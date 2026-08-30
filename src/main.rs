@@ -45,7 +45,7 @@ enum Command {
         cert: PathBuf,
         #[arg(long, default_value = "rflow-key.der")]
         key: PathBuf,
-        /// Size of this screen in physical pixels.
+        /// Size of this screen in logical cursor coordinates.
         #[arg(long)]
         size: ScreenSize,
         /// Physical Linux evdev path. Repeat for keyboard and mouse.
