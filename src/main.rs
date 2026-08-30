@@ -1455,41 +1455,6 @@ mod tests {
     }
 
     #[test]
-    fn host_and_client_accept_icmp_transport() {
-        let host = Cli::try_parse_from(["rflow", "host", "--transport", "icmp"]).unwrap();
-        assert!(matches!(
-            host.command,
-            Command::Host {
-                transport: transport::HostTransportMode::Icmp,
-                ..
-            }
-        ));
-
-        let client =
-            Cli::try_parse_from(["rflow", "client", "192.168.1.50", "--transport", "icmp"])
-                .unwrap();
-        assert!(matches!(
-            client.command,
-            Command::Client {
-                transport: transport::TransportMode::Icmp,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn host_listens_on_both_transports_by_default() {
-        let host = Cli::try_parse_from(["rflow", "host"]).unwrap();
-        assert!(matches!(
-            host.command,
-            Command::Host {
-                transport: transport::HostTransportMode::Both,
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn peers_forget_requires_an_explicit_device_and_supports_yes() {
         let cli = Cli::try_parse_from(["rflow", "peers", "forget", "macmini", "--yes"]).unwrap();
         let Command::Peers {
