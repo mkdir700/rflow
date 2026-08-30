@@ -67,9 +67,8 @@ RUST_LOG=rflow=info rflow host \
   --device /dev/input/by-id/your-mouse-event-mouse
 ```
 
-`--right` remains available as a compatibility alias for `--direction right`. Cardinal layouts
-cross a shared edge. Diagonal layouts touch at one corner, so the pointer must move outward across
-both axes together to cross; it returns through the opposite corner.
+Cardinal layouts cross a shared edge. Diagonal layouts touch at one corner, so the pointer must
+move outward across both axes together to cross; it returns through the opposite corner.
 
 On the client screen, connect to the host:
 

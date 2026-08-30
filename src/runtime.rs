@@ -406,7 +406,6 @@ fn classify_fault(error: &anyhow::Error) -> AppFault {
     let kind = if lower.contains("permission") || lower.contains("accessibility") {
         FaultKind::PermissionDenied
     } else if lower.contains("pass --direction")
-        || lower.contains("pass --right")
         || lower.contains("invalid")
         || lower.contains("configuration")
     {
@@ -435,7 +434,7 @@ async fn run_host(
 ) -> Result<()> {
     let direction = config
         .direction
-        .context("screen direction is required; pass --direction or legacy --right")?;
+        .context("screen direction is required; pass --direction")?;
     platform::validate_capture(&config.devices)?;
     let endpoint = transport::server_endpoint(config.bind, &config.cert, &config.key)?;
     tracing::info!(local = %endpoint.local_addr()?, "host listening");

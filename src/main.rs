@@ -43,11 +43,8 @@ enum Command {
         /// Physical Linux evdev path. Repeat for keyboard and mouse.
         #[arg(long)]
         device: Vec<PathBuf>,
-        /// Place the single client screen to the right of this host.
-        #[arg(long, conflicts_with = "direction")]
-        right: bool,
         /// Place the client in one of eight directions relative to the host.
-        #[arg(long, value_name = "DIRECTION", conflicts_with = "right")]
+        #[arg(long, value_name = "DIRECTION")]
         direction: Option<ScreenDirection>,
     },
     /// Join a host as a remotely controlled screen.
@@ -128,7 +125,6 @@ impl Command {
                 key,
                 size,
                 device,
-                right,
                 direction,
             } => AppCommand::StartHost(HostConfig {
                 bind,
@@ -136,7 +132,7 @@ impl Command {
                 key,
                 size,
                 devices: device,
-                direction: direction.or(right.then_some(ScreenDirection::Right)),
+                direction,
             }),
             Command::Client {
                 target,
@@ -157,33 +153,6 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn host_parses_explicit_right_layout() {
-        let cli = Cli::try_parse_from([
-            "rflow",
-            "host",
-            "--size",
-            "1920x1080",
-            "--right",
-            "--device",
-            "/dev/input/event1",
-        ])
-        .unwrap();
-        match cli.command {
-            Command::Host {
-                size,
-                right,
-                device,
-                ..
-            } => {
-                assert_eq!(size, ScreenSize::new(1920, 1080).unwrap());
-                assert!(right);
-                assert_eq!(device, vec![PathBuf::from("/dev/input/event1")]);
-            }
-            _ => panic!("expected host command"),
-        }
-    }
 
     #[test]
     fn host_parses_all_direction_names() {
@@ -209,40 +178,16 @@ mod tests {
                 "/dev/input/event1",
             ])
             .unwrap();
-            let Command::Host {
-                direction, right, ..
-            } = cli.command
-            else {
+            let Command::Host { direction, .. } = cli.command else {
                 panic!("expected host command")
             };
             assert_eq!(direction.unwrap().to_string(), name);
-            assert!(!right);
         }
     }
 
     #[test]
-    fn legacy_right_maps_to_right_direction() {
-        let cli = Cli::try_parse_from(["rflow", "host", "--size", "1920x1080", "--right"]).unwrap();
-        let AppCommand::StartHost(config) = cli.command.into_app_command() else {
-            panic!("expected host command")
-        };
-        assert_eq!(config.direction, Some(ScreenDirection::Right));
-    }
-
-    #[test]
-    fn host_rejects_conflicting_layout_options() {
-        assert!(
-            Cli::try_parse_from([
-                "rflow",
-                "host",
-                "--size",
-                "1920x1080",
-                "--right",
-                "--direction",
-                "left",
-            ])
-            .is_err()
-        );
+    fn host_rejects_retired_right_option() {
+        assert!(Cli::try_parse_from(["rflow", "host", "--size", "1920x1080", "--right"]).is_err());
     }
 
     #[test]

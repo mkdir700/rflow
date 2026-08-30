@@ -72,10 +72,6 @@ enum SessionRole {
 }
 
 impl DesktopSession {
-    pub fn host_right(local: ScreenSize, remote: ScreenSize) -> Self {
-        Self::host(local, remote, ScreenDirection::Right)
-    }
-
     pub fn host(local: ScreenSize, remote: ScreenSize, direction: ScreenDirection) -> Self {
         Self {
             role: SessionRole::Host,
@@ -254,9 +250,10 @@ mod tests {
     use super::*;
 
     fn host() -> DesktopSession {
-        DesktopSession::host_right(
+        DesktopSession::host(
             ScreenSize::new(100, 100).unwrap(),
             ScreenSize::new(200, 200).unwrap(),
+            ScreenDirection::Right,
         )
     }
 
