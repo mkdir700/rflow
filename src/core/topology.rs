@@ -19,6 +19,31 @@ pub enum Edge {
     Left,
 }
 
+impl fmt::Display for Edge {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Top => "top",
+            Self::Right => "right",
+            Self::Bottom => "bottom",
+            Self::Left => "left",
+        })
+    }
+}
+
+impl FromStr for Edge {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "top" => Ok(Self::Top),
+            "right" => Ok(Self::Right),
+            "bottom" => Ok(Self::Bottom),
+            "left" => Ok(Self::Left),
+            _ => Err(format!("unknown screen edge {value}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ScreenEdge {
     pub screen_id: ScreenId,
@@ -48,6 +73,337 @@ impl ScreenNode {
 pub struct ScreenLink {
     pub from: ScreenEdge,
     pub to: ScreenEdge,
+}
+
+pub const LAYOUT_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenDescriptor {
+    pub screen_id: ScreenId,
+    pub device_id: TopologyDeviceId,
+    pub device_name: String,
+    pub name: String,
+    pub logical_size: ScreenSize,
+    #[serde(default)]
+    pub primary: bool,
+    pub online: bool,
+    pub this_device: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenInventory {
+    pub screens: Vec<ScreenDescriptor>,
+}
+
+impl ScreenInventory {
+    pub fn validate(&self) -> Result<(), LayoutError> {
+        let mut ids = HashSet::new();
+        for screen in &self.screens {
+            if screen.screen_id.0.trim().is_empty() {
+                return Err(LayoutError::Invalid("screen ID cannot be empty".to_owned()));
+            }
+            if !ids.insert(&screen.screen_id) {
+                return Err(LayoutError::Invalid(format!(
+                    "duplicate screen ID {}",
+                    screen.screen_id.0
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn contains(&self, screen_id: &ScreenId) -> bool {
+        self.screens
+            .iter()
+            .any(|screen| &screen.screen_id == screen_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenSizeOverride {
+    pub screen_id: ScreenId,
+    pub size: ScreenSize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenLayout {
+    pub schema_version: u16,
+    pub revision: u64,
+    pub links: Vec<ScreenLink>,
+    pub size_overrides: Vec<ScreenSizeOverride>,
+}
+
+impl Default for ScreenLayout {
+    fn default() -> Self {
+        Self {
+            schema_version: LAYOUT_SCHEMA_VERSION,
+            revision: 0,
+            links: Vec::new(),
+            size_overrides: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RelativePosition {
+    LeftOf,
+    RightOf,
+    Above,
+    Below,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LayoutCommand {
+    Place {
+        screen_id: ScreenId,
+        anchor_id: ScreenId,
+        position: RelativePosition,
+        replace: bool,
+    },
+    Link {
+        from: ScreenEdge,
+        to: ScreenEdge,
+        replace: bool,
+    },
+    Unlink {
+        edge: ScreenEdge,
+    },
+    Unplace {
+        screen_id: ScreenId,
+    },
+    SetSizeOverride {
+        screen_id: ScreenId,
+        size: Option<ScreenSize>,
+    },
+    Replace {
+        layout: ScreenLayout,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayoutError {
+    UnknownScreen(ScreenId),
+    EdgeOccupied(ScreenEdge),
+    Invalid(String),
+}
+
+impl fmt::Display for LayoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownScreen(screen) => write!(formatter, "unknown screen {}", screen.0),
+            Self::EdgeOccupied(edge) => {
+                write!(
+                    formatter,
+                    "{}.{} is already linked",
+                    edge.screen_id.0, edge.edge
+                )
+            }
+            Self::Invalid(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for LayoutError {}
+
+impl ScreenLayout {
+    pub fn from_topology(topology: &ScreenTopology) -> Self {
+        Self {
+            revision: topology.revision,
+            links: topology.links.clone(),
+            size_overrides: topology
+                .screens
+                .iter()
+                .filter_map(|screen| {
+                    screen.size_override.map(|size| ScreenSizeOverride {
+                        screen_id: screen.screen_id.clone(),
+                        size,
+                    })
+                })
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    pub fn validate(&self, inventory: &ScreenInventory) -> Result<(), LayoutError> {
+        if self.schema_version != LAYOUT_SCHEMA_VERSION {
+            return Err(LayoutError::Invalid(format!(
+                "unsupported layout schema version {}",
+                self.schema_version
+            )));
+        }
+        inventory.validate()?;
+        let mut occupied = HashSet::new();
+        for link in &self.links {
+            for endpoint in [&link.from, &link.to] {
+                if !inventory.contains(&endpoint.screen_id) {
+                    return Err(LayoutError::UnknownScreen(endpoint.screen_id.clone()));
+                }
+                if !occupied.insert(endpoint.clone()) {
+                    return Err(LayoutError::EdgeOccupied(endpoint.clone()));
+                }
+            }
+            if link.from == link.to || opposite(link.from.edge) != link.to.edge {
+                return Err(LayoutError::Invalid(
+                    "linked screen edges must be distinct and face each other".to_owned(),
+                ));
+            }
+        }
+        let mut overridden = HashSet::new();
+        for value in &self.size_overrides {
+            if !inventory.contains(&value.screen_id) {
+                return Err(LayoutError::UnknownScreen(value.screen_id.clone()));
+            }
+            if !overridden.insert(&value.screen_id) {
+                return Err(LayoutError::Invalid(format!(
+                    "duplicate size override for {}",
+                    value.screen_id.0
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn apply(
+        &self,
+        inventory: &ScreenInventory,
+        command: LayoutCommand,
+    ) -> Result<Self, LayoutError> {
+        self.validate(inventory)?;
+        let mut next = match command {
+            LayoutCommand::Place {
+                screen_id,
+                anchor_id,
+                position,
+                replace,
+            } => {
+                let (anchor_edge, screen_edge) = match position {
+                    RelativePosition::LeftOf => (Edge::Left, Edge::Right),
+                    RelativePosition::RightOf => (Edge::Right, Edge::Left),
+                    RelativePosition::Above => (Edge::Top, Edge::Bottom),
+                    RelativePosition::Below => (Edge::Bottom, Edge::Top),
+                };
+                self.link(
+                    inventory,
+                    ScreenEdge {
+                        screen_id: anchor_id,
+                        edge: anchor_edge,
+                    },
+                    ScreenEdge {
+                        screen_id,
+                        edge: screen_edge,
+                    },
+                    replace,
+                )?
+            }
+            LayoutCommand::Link { from, to, replace } => self.link(inventory, from, to, replace)?,
+            LayoutCommand::Unlink { edge } => {
+                if !inventory.contains(&edge.screen_id) {
+                    return Err(LayoutError::UnknownScreen(edge.screen_id));
+                }
+                let mut value = self.clone();
+                value
+                    .links
+                    .retain(|link| link.from != edge && link.to != edge);
+                value
+            }
+            LayoutCommand::Unplace { screen_id } => {
+                if !inventory.contains(&screen_id) {
+                    return Err(LayoutError::UnknownScreen(screen_id));
+                }
+                let mut value = self.clone();
+                value.links.retain(|link| {
+                    link.from.screen_id != screen_id && link.to.screen_id != screen_id
+                });
+                value
+            }
+            LayoutCommand::SetSizeOverride { screen_id, size } => {
+                if !inventory.contains(&screen_id) {
+                    return Err(LayoutError::UnknownScreen(screen_id));
+                }
+                let mut value = self.clone();
+                value
+                    .size_overrides
+                    .retain(|entry| entry.screen_id != screen_id);
+                if let Some(size) = size {
+                    value
+                        .size_overrides
+                        .push(ScreenSizeOverride { screen_id, size });
+                }
+                value
+            }
+            LayoutCommand::Replace { layout } => layout,
+        };
+        next.revision = self.revision.saturating_add(1);
+        next.validate(inventory)?;
+        Ok(next)
+    }
+
+    pub fn resolve(&self, inventory: &ScreenInventory) -> Result<ScreenTopology, LayoutError> {
+        self.validate(inventory)?;
+        let screens = inventory
+            .screens
+            .iter()
+            .map(|screen| ScreenNode {
+                screen_id: screen.screen_id.clone(),
+                device_id: screen.device_id.clone(),
+                device_name: screen.device_name.clone(),
+                name: screen.name.clone(),
+                logical_size: screen.logical_size,
+                size_override: self
+                    .size_overrides
+                    .iter()
+                    .find(|value| value.screen_id == screen.screen_id)
+                    .map(|value| value.size),
+                online: screen.online,
+                this_device: screen.this_device,
+            })
+            .collect();
+        Ok(ScreenTopology {
+            revision: self.revision,
+            screens,
+            links: self.links.clone(),
+        })
+    }
+
+    fn link(
+        &self,
+        inventory: &ScreenInventory,
+        from: ScreenEdge,
+        to: ScreenEdge,
+        replace: bool,
+    ) -> Result<Self, LayoutError> {
+        for endpoint in [&from, &to] {
+            if !inventory.contains(&endpoint.screen_id) {
+                return Err(LayoutError::UnknownScreen(endpoint.screen_id.clone()));
+            }
+        }
+        if from.screen_id == to.screen_id {
+            return Err(LayoutError::Invalid(
+                "a screen cannot be linked to itself".to_owned(),
+            ));
+        }
+        if opposite(from.edge) != to.edge {
+            return Err(LayoutError::Invalid(
+                "linked screen edges must face each other".to_owned(),
+            ));
+        }
+        let mut next = self.clone();
+        let occupied = |link: &ScreenLink| {
+            link.from == from || link.to == from || link.from == to || link.to == to
+        };
+        if !replace && let Some(link) = next.links.iter().find(|link| occupied(link)) {
+            let edge = if link.from == from || link.to == from {
+                from
+            } else {
+                to
+            };
+            return Err(LayoutError::EdgeOccupied(edge));
+        }
+        next.links.retain(|link| !occupied(link));
+        next.links.push(ScreenLink { from, to });
+        Ok(next)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,17 +494,17 @@ impl<K> Default for EdgeBarrier<K> {
     }
 }
 
-pub struct TopologyRouter<'a> {
-    topology: &'a ScreenTopology,
+pub struct TopologyRouter {
+    topology: ScreenTopology,
     active: ScreenId,
     x: i32,
     y: i32,
     barrier: EdgeBarrier<Edge>,
 }
 
-impl<'a> TopologyRouter<'a> {
+impl TopologyRouter {
     pub fn new(
-        topology: &'a ScreenTopology,
+        topology: &ScreenTopology,
         active: ScreenId,
         x: i32,
         y: i32,
@@ -161,7 +517,7 @@ impl<'a> TopologyRouter<'a> {
             .ok_or_else(|| format!("active screen {} is not in the topology", active.0))?
             .effective_size();
         Ok(Self {
-            topology,
+            topology: topology.clone(),
             active,
             x: x.clamp(0, size.width - 1),
             y: y.clamp(0, size.height - 1),
@@ -171,6 +527,36 @@ impl<'a> TopologyRouter<'a> {
 
     pub fn active_screen(&self) -> &ScreenId {
         &self.active
+    }
+
+    pub(crate) fn set_position(&mut self, active: ScreenId, x: i32, y: i32) -> Result<(), String> {
+        let size = self
+            .topology
+            .screens
+            .iter()
+            .find(|screen| screen.screen_id == active)
+            .ok_or_else(|| format!("active screen {} is not in the topology", active.0))?
+            .effective_size();
+        self.active = active;
+        self.x = x.clamp(0, size.width - 1);
+        self.y = y.clamp(0, size.height - 1);
+        self.barrier.reset();
+        Ok(())
+    }
+
+    pub(crate) fn replace_topology(&mut self, topology: &ScreenTopology) -> Result<(), String> {
+        topology.validate()?;
+        let size = topology
+            .screens
+            .iter()
+            .find(|screen| screen.screen_id == self.active)
+            .ok_or_else(|| format!("active screen {} is not in the topology", self.active.0))?
+            .effective_size();
+        self.x = self.x.clamp(0, size.width - 1);
+        self.y = self.y.clamp(0, size.height - 1);
+        self.topology = topology.clone();
+        self.barrier.reset();
+        Ok(())
     }
 
     pub fn route_motion(&mut self, dx: i32, dy: i32) -> TopologyRoute {
@@ -267,13 +653,21 @@ impl<'a> TopologyRouter<'a> {
         };
         self.topology.links.iter().find_map(|link| {
             if link.from == source {
-                Some(&link.to)
+                self.is_online(&link.to.screen_id).then_some(&link.to)
             } else if link.to == source {
-                Some(&link.from)
+                self.is_online(&link.from.screen_id).then_some(&link.from)
             } else {
                 None
             }
         })
+    }
+
+    fn is_online(&self, id: &ScreenId) -> bool {
+        self.topology
+            .screens
+            .iter()
+            .find(|screen| &screen.screen_id == id)
+            .is_some_and(|screen| screen.online)
     }
 
     fn screen_size(&self, id: &ScreenId) -> ScreenSize {
@@ -1098,5 +1492,165 @@ mod tests {
             matches!(router.route_motion(8, 0), TopologyRoute::Cross { screen_id: ScreenId(ref id), .. } if id == "c")
         );
         assert_eq!(router.active_screen(), &ScreenId("c".into()));
+    }
+
+    #[test]
+    fn relative_placement_replaces_conflicting_links_atomically() {
+        let inventory = ScreenInventory {
+            screens: vec![
+                screen_descriptor("a", "local", true),
+                screen_descriptor("b", "peer", false),
+                screen_descriptor("c", "peer-2", false),
+            ],
+        };
+        let layout = ScreenLayout {
+            revision: 4,
+            links: vec![ScreenLink {
+                from: ScreenEdge {
+                    screen_id: ScreenId("a".into()),
+                    edge: Edge::Right,
+                },
+                to: ScreenEdge {
+                    screen_id: ScreenId("b".into()),
+                    edge: Edge::Left,
+                },
+            }],
+            ..ScreenLayout::default()
+        };
+
+        assert!(matches!(
+            layout.apply(
+                &inventory,
+                LayoutCommand::Place {
+                    screen_id: ScreenId("c".into()),
+                    anchor_id: ScreenId("a".into()),
+                    position: RelativePosition::RightOf,
+                    replace: false,
+                },
+            ),
+            Err(LayoutError::EdgeOccupied(_))
+        ));
+        let replaced = layout
+            .apply(
+                &inventory,
+                LayoutCommand::Place {
+                    screen_id: ScreenId("c".into()),
+                    anchor_id: ScreenId("a".into()),
+                    position: RelativePosition::RightOf,
+                    replace: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(replaced.revision, 5);
+        assert_eq!(replaced.links.len(), 1);
+        assert_eq!(replaced.links[0].to.screen_id, ScreenId("c".into()));
+    }
+
+    #[test]
+    fn resolving_layout_keeps_offline_inventory_but_routes_only_online_links() {
+        let inventory = ScreenInventory {
+            screens: vec![
+                screen_descriptor("a", "local", true),
+                screen_descriptor("b", "peer", false),
+            ],
+        };
+        let layout = ScreenLayout {
+            revision: 2,
+            links: vec![ScreenLink {
+                from: ScreenEdge {
+                    screen_id: ScreenId("a".into()),
+                    edge: Edge::Right,
+                },
+                to: ScreenEdge {
+                    screen_id: ScreenId("b".into()),
+                    edge: Edge::Left,
+                },
+            }],
+            ..ScreenLayout::default()
+        };
+
+        let topology = layout.resolve(&inventory).unwrap();
+        assert_eq!(topology.screens.len(), 2);
+        assert!(!topology.screens[1].online);
+        let mut router = TopologyRouter::new(&topology, ScreenId("a".into()), 99, 50).unwrap();
+        assert!(matches!(
+            router.route_motion(8, 0),
+            TopologyRoute::Stay { screen_id: ScreenId(ref id), .. } if id == "a"
+        ));
+    }
+
+    #[test]
+    fn unlink_unplace_and_size_override_share_the_revisioned_layout_seam() {
+        let inventory = ScreenInventory {
+            screens: vec![
+                screen_descriptor("a", "local", true),
+                screen_descriptor("b", "peer", true),
+            ],
+        };
+        let layout = ScreenLayout::default()
+            .apply(
+                &inventory,
+                LayoutCommand::Link {
+                    from: ScreenEdge {
+                        screen_id: ScreenId("a".into()),
+                        edge: Edge::Right,
+                    },
+                    to: ScreenEdge {
+                        screen_id: ScreenId("b".into()),
+                        edge: Edge::Left,
+                    },
+                    replace: false,
+                },
+            )
+            .unwrap();
+        let layout = layout
+            .apply(
+                &inventory,
+                LayoutCommand::SetSizeOverride {
+                    screen_id: ScreenId("b".into()),
+                    size: Some(ScreenSize::new(200, 150).unwrap()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            layout.resolve(&inventory).unwrap().screens[1].effective_size(),
+            ScreenSize::new(200, 150).unwrap()
+        );
+        let layout = layout
+            .apply(
+                &inventory,
+                LayoutCommand::Unlink {
+                    edge: ScreenEdge {
+                        screen_id: ScreenId("a".into()),
+                        edge: Edge::Right,
+                    },
+                },
+            )
+            .unwrap();
+        assert!(layout.links.is_empty());
+        let layout = layout
+            .apply(
+                &inventory,
+                LayoutCommand::SetSizeOverride {
+                    screen_id: ScreenId("b".into()),
+                    size: None,
+                },
+            )
+            .unwrap();
+        assert!(layout.size_overrides.is_empty());
+        assert_eq!(layout.revision, 4);
+    }
+
+    fn screen_descriptor(id: &str, device: &str, online: bool) -> ScreenDescriptor {
+        ScreenDescriptor {
+            screen_id: ScreenId(id.into()),
+            device_id: TopologyDeviceId(device.into()),
+            device_name: device.into(),
+            name: format!("display-{id}"),
+            logical_size: ScreenSize::new(100, 100).unwrap(),
+            primary: id == "a",
+            online,
+            this_device: id == "a",
+        }
     }
 }

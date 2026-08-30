@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::{Button, ButtonState, InputEvent, Key, Motion as DomainMotion};
 
-pub const PROTOCOL_VERSION: u16 = 2;
-pub const MAX_RELIABLE_FRAME: usize = 1024;
+pub const PROTOCOL_VERSION: u16 = 3;
+pub const MAX_RELIABLE_FRAME: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MotionDto {
@@ -17,15 +17,27 @@ pub struct MotionDto {
 /// Compatibility alias for protocol-v2 callers during the architecture migration.
 pub type Motion = MotionDto;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireScreenDescriptor {
+    pub stable_id: String,
+    pub name: String,
+    pub width: i32,
+    pub height: i32,
+    pub primary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReliableEvent {
     Hello {
         version: u16,
+        screens: Vec<WireScreenDescriptor>,
     },
     ClientHello {
         version: u16,
-        width: i32,
-        height: i32,
+        screens: Vec<WireScreenDescriptor>,
+    },
+    ScreenInventory {
+        screens: Vec<WireScreenDescriptor>,
     },
     EnterScreen {
         x: i32,
@@ -252,5 +264,30 @@ mod tests {
         let bytes = encode_frame(&ReliableEvent::ReleaseAll).unwrap();
         let length = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
         assert_eq!(length, bytes.len() - 4);
+    }
+
+    #[test]
+    fn reliable_handshake_round_trips_multiple_screens() {
+        let event = ReliableEvent::ClientHello {
+            version: PROTOCOL_VERSION,
+            screens: vec![
+                WireScreenDescriptor {
+                    stable_id: "display-a".into(),
+                    name: "DP-1".into(),
+                    width: 2560,
+                    height: 1440,
+                    primary: true,
+                },
+                WireScreenDescriptor {
+                    stable_id: "display-b".into(),
+                    name: "HDMI-1".into(),
+                    width: 1920,
+                    height: 1080,
+                    primary: false,
+                },
+            ],
+        };
+        let frame = encode_frame(&event).unwrap();
+        assert_eq!(decode::<ReliableEvent>(&frame[4..]).unwrap(), event);
     }
 }

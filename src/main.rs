@@ -7,9 +7,12 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use rflow::{
-    core::{ScreenDirection, ScreenSize},
+    core::{
+        Edge, LayoutCommand, RelativePosition, ScreenDirection, ScreenEdge, ScreenId, ScreenLayout,
+        ScreenSize, ScreenTopology,
+    },
     identity::{device_display_name, ensure_identity, resolve_identity_paths},
     management::{
         ManagementRequest, ManagementResponse, ManagementServer, default_endpoint_path,
@@ -57,7 +60,7 @@ enum Command {
         /// Physical Linux evdev path. Repeat for keyboard and mouse.
         #[arg(long)]
         device: Vec<PathBuf>,
-        /// Place the client in one of eight directions relative to the host.
+        /// One-time migration aid for an unconfigured single-screen peer (cardinal directions only).
         #[arg(long, value_name = "DIRECTION")]
         direction: Option<ScreenDirection>,
     },
@@ -86,19 +89,82 @@ enum Command {
     },
     /// Render the authoritative screen topology.
     Layout {
+        #[command(subcommand)]
+        command: Option<LayoutSubcommand>,
         /// Redraw whenever the topology revision changes.
         #[arg(long)]
         watch: bool,
         /// Emit the versioned machine-readable schema.
         #[arg(long, conflicts_with = "watch")]
         json: bool,
-        /// Replace the topology from a JSON file through the running host.
-        #[arg(long, value_name = "FILE", conflicts_with_all = ["watch", "json"], requires = "expected_revision")]
-        apply: Option<PathBuf>,
-        /// Revision observed before editing; prevents lost updates.
-        #[arg(long, requires = "apply")]
-        expected_revision: Option<u64>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum LayoutSubcommand {
+    /// List known screens and their current placement status.
+    Screens,
+    /// Place one screen relative to another screen.
+    #[command(group(ArgGroup::new("position").required(true).multiple(false).args(["left_of", "right_of", "above", "below"])))]
+    Place {
+        screen: String,
+        #[arg(long)]
+        left_of: Option<String>,
+        #[arg(long)]
+        right_of: Option<String>,
+        #[arg(long)]
+        above: Option<String>,
+        #[arg(long)]
+        below: Option<String>,
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Link two exact screen edges.
+    Link {
+        from: EdgeSpec,
+        to: EdgeSpec,
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Remove the link attached to one screen edge.
+    Unlink { edge: EdgeSpec },
+    /// Remove every link attached to a screen.
+    Unplace { screen: String },
+    /// Override the logical size used for coordinate mapping.
+    SetSize { screen: String, size: ScreenSize },
+    /// Clear a logical size override.
+    ClearSize { screen: String },
+    /// Export the persistent user layout document.
+    Export,
+    /// Replace the persistent user layout document.
+    Apply {
+        file: PathBuf,
+        #[arg(long)]
+        expected_revision: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EdgeSpec {
+    screen: String,
+    edge: Edge,
+}
+
+impl std::str::FromStr for EdgeSpec {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let (screen, edge) = value
+            .rsplit_once('.')
+            .ok_or_else(|| "screen edge must use SCREEN.EDGE syntax".to_owned())?;
+        if screen.trim().is_empty() {
+            return Err("screen edge must name a screen".to_owned());
+        }
+        Ok(Self {
+            screen: screen.to_owned(),
+            edge: edge.parse()?,
+        })
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -131,42 +197,19 @@ async fn main() -> Result<()> {
         }
         Command::Peers { command } => run_peers(command).await,
         Command::Layout {
+            command,
             watch,
             json,
-            apply,
-            expected_revision,
-        } => run_layout(watch, json, apply, expected_revision).await,
+        } => run_layout(command, watch, json).await,
         command => run_session(command).await,
     }
 }
 
-async fn run_layout(
-    watch: bool,
-    json: bool,
-    apply: Option<PathBuf>,
-    expected_revision: Option<u64>,
-) -> Result<()> {
+async fn run_layout(command: Option<LayoutSubcommand>, watch: bool, json: bool) -> Result<()> {
     let path = default_endpoint_path()?;
-    if let Some(file) = apply {
-        let topology: rflow::core::ScreenTopology =
-            serde_json::from_slice(&std::fs::read(&file).map_err(anyhow::Error::from)?)?;
-        topology.validate().map_err(anyhow::Error::msg)?;
-        return match management_request(
-            &path,
-            ManagementRequest::ReplaceTopology {
-                expected_revision: expected_revision.expect("clap requires the revision"),
-                topology,
-            },
-        )
-        .await?
-        {
-            ManagementResponse::TopologyQueued => {
-                println!("Topology update queued.");
-                Ok(())
-            }
-            ManagementResponse::Error(message) => bail!("{message}"),
-            _ => bail!("rflow host returned an invalid management response"),
-        };
+    if let Some(command) = command {
+        let topology = request_topology(&path).await?;
+        return run_layout_command(&path, topology, command).await;
     }
     let mut last_revision = None;
     loop {
@@ -197,6 +240,205 @@ async fn run_layout(
     }
 }
 
+async fn request_topology(path: &std::path::Path) -> Result<ScreenTopology> {
+    match management_request(path, ManagementRequest::Layout).await? {
+        ManagementResponse::Layout(topology) => Ok(topology),
+        ManagementResponse::Error(message) => bail!("{message}"),
+        _ => bail!("rflow host returned an invalid management response"),
+    }
+}
+
+async fn run_layout_command(
+    path: &std::path::Path,
+    topology: ScreenTopology,
+    command: LayoutSubcommand,
+) -> Result<()> {
+    match command {
+        LayoutSubcommand::Screens => {
+            print_screens(&topology);
+            Ok(())
+        }
+        LayoutSubcommand::Export => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&ScreenLayout::from_topology(&topology))?
+            );
+            Ok(())
+        }
+        LayoutSubcommand::Apply {
+            file,
+            expected_revision,
+        } => {
+            let layout: ScreenLayout = serde_json::from_slice(&std::fs::read(file)?)?;
+            submit_layout_command(path, expected_revision, LayoutCommand::Replace { layout }).await
+        }
+        LayoutSubcommand::Place {
+            screen,
+            left_of,
+            right_of,
+            above,
+            below,
+            replace,
+        } => {
+            let screen_id = resolve_screen_id(&topology, &screen)?;
+            let (anchor, position) = if let Some(anchor) = left_of {
+                (anchor, RelativePosition::LeftOf)
+            } else if let Some(anchor) = right_of {
+                (anchor, RelativePosition::RightOf)
+            } else if let Some(anchor) = above {
+                (anchor, RelativePosition::Above)
+            } else if let Some(anchor) = below {
+                (anchor, RelativePosition::Below)
+            } else {
+                unreachable!("clap requires one relative position")
+            };
+            let anchor_id = resolve_screen_id(&topology, &anchor)?;
+            submit_layout_command(
+                path,
+                topology.revision,
+                LayoutCommand::Place {
+                    screen_id,
+                    anchor_id,
+                    position,
+                    replace,
+                },
+            )
+            .await
+        }
+        LayoutSubcommand::Link { from, to, replace } => {
+            let from = resolve_edge(&topology, from)?;
+            let to = resolve_edge(&topology, to)?;
+            submit_layout_command(
+                path,
+                topology.revision,
+                LayoutCommand::Link { from, to, replace },
+            )
+            .await
+        }
+        LayoutSubcommand::Unlink { edge } => {
+            let edge = resolve_edge(&topology, edge)?;
+            submit_layout_command(path, topology.revision, LayoutCommand::Unlink { edge }).await
+        }
+        LayoutSubcommand::Unplace { screen } => {
+            let screen_id = resolve_screen_id(&topology, &screen)?;
+            submit_layout_command(
+                path,
+                topology.revision,
+                LayoutCommand::Unplace { screen_id },
+            )
+            .await
+        }
+        LayoutSubcommand::SetSize { screen, size } => {
+            let screen_id = resolve_screen_id(&topology, &screen)?;
+            submit_layout_command(
+                path,
+                topology.revision,
+                LayoutCommand::SetSizeOverride {
+                    screen_id,
+                    size: Some(size),
+                },
+            )
+            .await
+        }
+        LayoutSubcommand::ClearSize { screen } => {
+            let screen_id = resolve_screen_id(&topology, &screen)?;
+            submit_layout_command(
+                path,
+                topology.revision,
+                LayoutCommand::SetSizeOverride {
+                    screen_id,
+                    size: None,
+                },
+            )
+            .await
+        }
+    }
+}
+
+async fn submit_layout_command(
+    path: &std::path::Path,
+    expected_revision: u64,
+    command: LayoutCommand,
+) -> Result<()> {
+    match management_request(
+        path,
+        ManagementRequest::ApplyLayout {
+            expected_revision,
+            command,
+        },
+    )
+    .await?
+    {
+        ManagementResponse::LayoutUpdated(topology) => {
+            println!("Layout updated to revision {}.", topology.revision);
+            Ok(())
+        }
+        ManagementResponse::Error(message) => bail!("{message}"),
+        _ => bail!("rflow host returned an invalid management response"),
+    }
+}
+
+fn resolve_edge(topology: &ScreenTopology, value: EdgeSpec) -> Result<ScreenEdge> {
+    Ok(ScreenEdge {
+        screen_id: resolve_screen_id(topology, &value.screen)?,
+        edge: value.edge,
+    })
+}
+
+fn resolve_screen_id(topology: &ScreenTopology, query: &str) -> Result<ScreenId> {
+    if let Some(screen) = topology
+        .screens
+        .iter()
+        .find(|screen| screen.screen_id.0 == query)
+    {
+        return Ok(screen.screen_id.clone());
+    }
+    let matches: Vec<_> = topology
+        .screens
+        .iter()
+        .filter(|screen| {
+            screen.device_id.0 == query || screen.device_name == query || screen.name == query
+        })
+        .collect();
+    match matches.as_slice() {
+        [screen] => Ok(screen.screen_id.clone()),
+        [] => bail!("screen or device {query:?} was not found"),
+        matches => bail!(
+            "device or screen name {query:?} matches multiple screens:\n{}\nSpecify a screen ID explicitly.",
+            matches
+                .iter()
+                .map(|screen| format!("  {}", screen.screen_id.0))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    }
+}
+
+fn print_screens(topology: &ScreenTopology) {
+    println!("SCREEN\tDEVICE\tSIZE\tSTATUS\tPLACEMENT");
+    for screen in &topology.screens {
+        let placement = if screen.this_device {
+            "local"
+        } else if topology.links.iter().any(|link| {
+            link.from.screen_id == screen.screen_id || link.to.screen_id == screen.screen_id
+        }) {
+            "placed"
+        } else {
+            "unplaced"
+        };
+        let size = screen.effective_size();
+        println!(
+            "{}\t{}\t{}x{}\t{}\t{}",
+            screen.screen_id.0,
+            screen.device_name,
+            size.width,
+            size.height,
+            if screen.online { "online" } else { "offline" },
+            placement
+        );
+    }
+}
+
 async fn run_peers(command: Option<PeersCommand>) -> Result<()> {
     match command {
         None => {
@@ -204,9 +446,21 @@ async fn run_peers(command: Option<PeersCommand>) -> Result<()> {
             if trust.peers().is_empty() {
                 println!("No trusted devices.");
             } else {
-                println!("TRUSTED DEVICES");
+                let topology =
+                    rflow::topology_store::load(&rflow::topology_store::default_path()?)?
+                        .unwrap_or_default();
+                println!("DEVICE\tTRUSTED\tONLINE\tSCREENS\tPLACEMENT\tFINGERPRINT");
                 for peer in trust.peers() {
-                    println!("{}  {}", peer.device_id, peer.display_name);
+                    let (online, screens, placement) =
+                        peer_layout_summary(&topology, &peer.device_id.to_string());
+                    println!(
+                        "{}\tyes\t{}\t{}\t{}\t{}",
+                        peer.display_name,
+                        if online { "yes" } else { "no" },
+                        screens,
+                        placement,
+                        peer.device_id,
+                    );
                 }
             }
         }
@@ -231,6 +485,9 @@ async fn run_peers(command: Option<PeersCommand>) -> Result<()> {
                     bail!("rflow host returned an invalid management response")
                 }
                 ManagementResponse::TopologyQueued => {
+                    bail!("rflow host returned an invalid management response")
+                }
+                ManagementResponse::LayoutUpdated(_) => {
                     bail!("rflow host returned an invalid management response")
                 }
             }
@@ -258,10 +515,45 @@ async fn run_peers(command: Option<PeersCommand>) -> Result<()> {
                 }
             }
             trust.forget(device_id)?;
+            if let Ok(response) = management_request(
+                default_endpoint_path()?,
+                ManagementRequest::ForgetPeer(device_id.to_string()),
+            )
+            .await
+                && let ManagementResponse::Error(message) = response
+            {
+                bail!("peer was forgotten, but the running host rejected the update: {message}");
+            }
             println!("Forgot {device}.");
         }
     }
     Ok(())
+}
+
+fn peer_layout_summary(topology: &ScreenTopology, device_id: &str) -> (bool, usize, &'static str) {
+    let screens: Vec<_> = topology
+        .screens
+        .iter()
+        .filter(|screen| screen.device_id.0 == device_id)
+        .collect();
+    let placed = screens
+        .iter()
+        .filter(|screen| {
+            topology.links.iter().any(|link| {
+                link.from.screen_id == screen.screen_id || link.to.screen_id == screen.screen_id
+            })
+        })
+        .count();
+    let placement = match (placed, screens.len()) {
+        (0, _) => "unplaced",
+        (placed, total) if placed == total => "placed",
+        _ => "partially placed",
+    };
+    (
+        screens.iter().any(|screen| screen.online),
+        screens.len(),
+        placement,
+    )
 }
 
 async fn submit_pairing_decision(request_id: PairingRequestId, accepted: bool) -> Result<()> {
@@ -280,6 +572,9 @@ async fn submit_pairing_decision(request_id: PairingRequestId, accepted: bool) -
             bail!("rflow host returned an invalid management response")
         }
         ManagementResponse::TopologyQueued => {
+            bail!("rflow host returned an invalid management response")
+        }
+        ManagementResponse::LayoutUpdated(_) => {
             bail!("rflow host returned an invalid management response")
         }
     }
@@ -776,5 +1071,79 @@ mod tests {
     #[test]
     fn retired_connect_command_is_not_exposed() {
         assert!(Cli::try_parse_from(["rflow", "connect", "192.168.1.50:24801"]).is_err());
+    }
+
+    #[test]
+    fn layout_place_parses_one_relative_direction() {
+        let cli = Cli::try_parse_from([
+            "rflow",
+            "layout",
+            "place",
+            "macmini",
+            "--right-of",
+            "linux/DP-1",
+            "--replace",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Layout {
+                command: Some(LayoutSubcommand::Place { screen, right_of: Some(anchor), replace: true, .. }),
+                ..
+            } if screen == "macmini" && anchor == "linux/DP-1"
+        ));
+    }
+
+    #[test]
+    fn screen_name_resolution_rejects_multi_display_device_shorthand() {
+        let topology = rflow::core::ScreenTopology {
+            screens: vec![
+                screen_node("device/a", "device", "DP-1"),
+                screen_node("device/b", "device", "DP-2"),
+            ],
+            ..Default::default()
+        };
+        let error = resolve_screen_id(&topology, "device").unwrap_err();
+        assert!(error.to_string().contains("multiple screens"));
+        assert!(error.to_string().contains("device/a"));
+        assert_eq!(resolve_screen_id(&topology, "DP-1").unwrap().0, "device/a");
+    }
+
+    #[test]
+    fn peers_summary_reports_partial_multi_display_placement() {
+        let mut topology = ScreenTopology {
+            screens: vec![
+                screen_node("device/a", "device", "DP-1"),
+                screen_node("device/b", "device", "DP-2"),
+            ],
+            ..Default::default()
+        };
+        topology.links.push(rflow::core::ScreenLink {
+            from: ScreenEdge {
+                screen_id: ScreenId("device/a".into()),
+                edge: Edge::Right,
+            },
+            to: ScreenEdge {
+                screen_id: ScreenId("other".into()),
+                edge: Edge::Left,
+            },
+        });
+        assert_eq!(
+            peer_layout_summary(&topology, "device"),
+            (true, 2, "partially placed")
+        );
+    }
+
+    fn screen_node(id: &str, device: &str, name: &str) -> rflow::core::ScreenNode {
+        rflow::core::ScreenNode {
+            screen_id: rflow::core::ScreenId(id.into()),
+            device_id: rflow::core::TopologyDeviceId(device.into()),
+            device_name: device.into(),
+            name: name.into(),
+            logical_size: ScreenSize::new(100, 100).unwrap(),
+            size_override: None,
+            online: true,
+            this_device: false,
+        }
     }
 }

@@ -11,13 +11,13 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use serde::de::DeserializeOwned;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     core::{
-        ButtonState, ControlTarget, DesktopSession, HeldInput, InputEvent, Motion, ScreenDirection,
-        ScreenId, ScreenNode, ScreenSize, ScreenTopology, SessionEffect, SessionEvent,
-        TopologyDeviceId,
+        ButtonState, ControlTarget, DesktopSession, HeldInput, InputEvent, LayoutCommand, Motion,
+        ScreenDescriptor, ScreenDirection, ScreenId, ScreenInventory, ScreenSize, ScreenTopology,
+        SessionEffect, SessionEvent, TopologyDeviceId,
     },
     identity::IdentityPaths,
     pairing::{
@@ -26,8 +26,8 @@ use crate::{
     },
     platform::{self, CapturedEvent, InputInjector},
     protocol::{
-        MAX_RELIABLE_FRAME, MotionDto, PROTOCOL_VERSION, ReliableEvent, decode, decode_input,
-        encode, encode_frame, encode_input,
+        MAX_RELIABLE_FRAME, MotionDto, PROTOCOL_VERSION, ReliableEvent, WireScreenDescriptor,
+        decode, decode_input, encode, encode_frame, encode_input,
     },
     target::ServerTarget,
     transport,
@@ -82,7 +82,7 @@ pub struct AppConfig {
     pub client: Option<ClientConfig>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 /// User intent accepted by the single-writer Runtime supervisor.
 /// Commands from one handle are processed in FIFO order.
 pub enum AppCommand {
@@ -92,9 +92,15 @@ pub enum AppCommand {
     UpdateConfig(AppConfig),
     AcceptPairing(PairingRequestId),
     RejectPairing(PairingRequestId),
+    ForgetPeer(DeviceId),
     ReplaceTopology {
         expected_revision: u64,
         topology: ScreenTopology,
+    },
+    ApplyLayout {
+        expected_revision: u64,
+        command: LayoutCommand,
+        respond_to: oneshot::Sender<std::result::Result<ScreenTopology, String>>,
     },
 }
 
@@ -182,6 +188,14 @@ struct AppEventBus {
 }
 
 impl AppEventBus {
+    fn snapshot_topology(&self) -> ScreenTopology {
+        self.snapshot
+            .read()
+            .expect("runtime snapshot poisoned")
+            .topology
+            .clone()
+    }
+
     async fn send(&self, event: AppEvent) {
         self.apply(&event);
         let _ = self.sender.send(event).await;
@@ -307,6 +321,24 @@ impl ApplicationHandle {
             .read()
             .expect("runtime snapshot poisoned")
             .clone()
+    }
+
+    pub async fn apply_layout(
+        &self,
+        expected_revision: u64,
+        command: LayoutCommand,
+    ) -> Result<ScreenTopology> {
+        let (respond_to, response) = oneshot::channel();
+        self.send(AppCommand::ApplyLayout {
+            expected_revision,
+            command,
+            respond_to,
+        })
+        .await?;
+        response
+            .await
+            .context("rflow runtime dropped the layout response")?
+            .map_err(anyhow::Error::msg)
     }
 }
 
@@ -454,6 +486,10 @@ async fn supervisor(
                 continue;
             }
             AppCommand::AcceptPairing(_) | AppCommand::RejectPairing(_) => continue,
+            AppCommand::ForgetPeer(device_id) => {
+                mark_peer_offline(device_id, &events).await;
+                continue;
+            }
             AppCommand::ReplaceTopology {
                 expected_revision,
                 topology,
@@ -468,10 +504,26 @@ async fn supervisor(
                 }
                 continue;
             }
+            AppCommand::ApplyLayout {
+                expected_revision,
+                command,
+                respond_to,
+            } => {
+                let result = apply_layout_command(expected_revision, command);
+                if let Ok(topology) = &result {
+                    events
+                        .send(AppEvent::TopologyChanged(topology.clone()))
+                        .await;
+                }
+                let _ = respond_to.send(result.map_err(|error| format!("{error:#}")));
+                continue;
+            }
         };
         publish_status(&events, RuntimeStatus::Starting).await;
         let (stop_tx, stop_rx) = watch::channel(false);
+        let (topology_tx, topology_rx) = watch::channel(events.snapshot_topology());
         let (pairing_tx, pairing_rx) = mpsc::channel(8);
+        let (forget_tx, forget_rx) = mpsc::channel(8);
         let session_events = events.clone();
         let session_diagnostics = diagnostics.clone();
         let mut task = tokio::spawn(async move {
@@ -481,6 +533,8 @@ async fn supervisor(
                         config,
                         stop_rx,
                         pairing_rx,
+                        topology_rx,
+                        forget_rx,
                         session_events,
                         session_diagnostics,
                     )
@@ -524,9 +578,20 @@ async fn supervisor(
                             expected_revision,
                             topology,
                         ) {
-                            Ok(topology) => events.send(AppEvent::TopologyChanged(topology)).await,
+                            Ok(topology) => {
+                                let _ = topology_tx.send(topology.clone());
+                                events.send(AppEvent::TopologyChanged(topology)).await;
+                            }
                             Err(error) => events.send(AppEvent::Faulted(classify_fault(&error))).await,
                         }
+                    }
+                    Some(AppCommand::ApplyLayout { expected_revision, command, respond_to }) => {
+                        let result = apply_layout_command(expected_revision, command);
+                        if let Ok(topology) = &result {
+                            let _ = topology_tx.send(topology.clone());
+                            events.send(AppEvent::TopologyChanged(topology.clone())).await;
+                        }
+                        let _ = respond_to.send(result.map_err(|error| format!("{error:#}")));
                     }
                     Some(AppCommand::RejectPairing(request_id)) => {
                         let _ = pairing_tx
@@ -535,6 +600,9 @@ async fn supervisor(
                                 accepted: false,
                             })
                             .await;
+                    }
+                    Some(AppCommand::ForgetPeer(device_id)) => {
+                        let _ = forget_tx.send(device_id).await;
                     }
                     Some(AppCommand::StartHost(_)) | Some(AppCommand::StartClient(_)) => {
                         let fault = AppFault {
@@ -547,6 +615,12 @@ async fn supervisor(
             }
         }
     }
+}
+
+fn apply_layout_command(expected_revision: u64, command: LayoutCommand) -> Result<ScreenTopology> {
+    let path = crate::topology_store::default_path()?;
+    let inventory = crate::topology_store::load_state(&path)?.inventory;
+    crate::topology_store::apply(&path, expected_revision, &inventory, command)
 }
 
 enum SessionKind {
@@ -599,7 +673,8 @@ fn classify_fault(error: &anyhow::Error) -> AppFault {
     let lower = message.to_ascii_lowercase();
     let kind = if lower.contains("permission") || lower.contains("accessibility") {
         FaultKind::PermissionDenied
-    } else if lower.contains("pass --direction")
+    } else if lower.contains("identity certificate")
+        || lower.contains("private key")
         || lower.contains("invalid")
         || lower.contains("configuration")
     {
@@ -624,13 +699,12 @@ async fn run_host(
     mut config: HostConfig,
     mut stop: watch::Receiver<bool>,
     mut pairing_decisions: mpsc::Receiver<PairingDecision>,
+    mut topology_updates: watch::Receiver<ScreenTopology>,
+    mut forgotten_peers: mpsc::Receiver<DeviceId>,
     events: AppEventBus,
     _diagnostics: Arc<dyn DiagnosticSink>,
 ) -> Result<()> {
-    let direction = config
-        .direction
-        .context("screen direction is required; pass --direction")?;
-    let detected_screens = platform::screens()?;
+    let mut detected_screens = platform::screens()?;
     let size = config.size.unwrap_or(
         detected_screens
             .iter()
@@ -649,48 +723,517 @@ async fn run_host(
     let local_device_id = DeviceId::from_certificate(
         &fs::read(&config.cert).context("read host identity certificate")?,
     );
-    let topology = reconcile_discovered_topology(
-        crate::topology_store::load(&crate::topology_store::default_path()?)?,
+    let topology_path = crate::topology_store::default_path()?;
+    let state = crate::topology_store::load_state(&topology_path)?;
+    let inventory = reconcile_discovered_inventory(
+        state.inventory,
         &config.device_name,
         local_device_id,
-        detected_screens,
+        &detected_screens,
     );
-    events.send(AppEvent::TopologyChanged(topology)).await;
+    crate::topology_store::save_inventory(&topology_path, &inventory)?;
+    let mut layout = state.layout;
+    let mut inventory = inventory;
+    let mut topology = layout.resolve(&inventory).map_err(anyhow::Error::msg)?;
+    events
+        .send(AppEvent::TopologyChanged(topology.clone()))
+        .await;
     let endpoint = transport::pairing_server_endpoint(config.bind, &identity)?;
     let mut trust = TrustStore::load(&config.trust_store)?;
     let mut pairing_rate_limiter = PairingRateLimiter::default();
     tracing::info!(local = %endpoint.local_addr()?, "host listening");
     publish_status(&events, RuntimeStatus::Listening).await;
+    let local_screen = topology
+        .screens
+        .iter()
+        .find(|screen| screen.this_device && screen.online)
+        .context("no online local screen is available")?
+        .screen_id
+        .clone();
+    let (cursor_x, cursor_y) = platform::cursor_position().unwrap_or((0, 0));
+    let mut session = DesktopSession::host_topology(&topology, local_screen, cursor_x, cursor_y)
+        .map_err(anyhow::Error::msg)?;
+    let mut peers: HashMap<TopologyDeviceId, HostPeer> = HashMap::new();
+    let (disconnected_tx, mut disconnected_rx) = mpsc::channel(64);
+    let (inventory_tx, mut inventory_rx) = mpsc::channel(64);
+    let mut capture = None;
+    let mut injector = None;
+    let mut held_sources = HashMap::new();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     loop {
-        let connection = tokio::select! {
-            connection = transport::accept_one(&endpoint) => connection?,
-            _ = wait_for_stop(&mut stop) => return Ok(()),
-        };
-        let remote = connection.remote_address();
-        if !authorize_host_peer(
-            &connection,
-            &config,
-            &mut trust,
-            &mut pairing_rate_limiter,
-            &mut pairing_decisions,
-            &mut stop,
-            &events,
-        )
-        .await?
-        {
-            connection.close(0_u32.into(), b"pairing rejected");
-            if *stop.borrow() {
-                return Ok(());
+        tokio::select! {
+            accepted = transport::accept_one(&endpoint) => {
+                let connection = accepted?;
+                let remote = connection.remote_address();
+                let Some(peer) = authorize_host_peer(
+                    &connection,
+                    &config,
+                    &mut trust,
+                    &mut pairing_rate_limiter,
+                    &mut pairing_decisions,
+                    &mut stop,
+                    &events,
+                ).await? else {
+                    connection.close(0_u32.into(), b"pairing rejected");
+                    continue;
+                };
+                let (host_peer, remote_screens, mut metadata) = prepare_host_peer(
+                    connection,
+                    peer,
+                    &detected_screens,
+                    &mut stop,
+                ).await?;
+                merge_remote_inventory(&mut inventory, &host_peer.summary, &remote_screens);
+                crate::topology_store::save_inventory(&topology_path, &inventory)?;
+                if !layout.links.is_empty() && config.direction.is_some() {
+                    bail!("--direction cannot be used after a persistent layout has been configured");
+                }
+                if layout.links.is_empty()
+                    && let Some(direction) = config.direction.take()
+                {
+                    tracing::warn!(%direction, "migrating legacy --direction into the persistent layout");
+                    let migrated = migrate_legacy_direction(&layout, &inventory, direction)?;
+                    topology = crate::topology_store::apply(
+                        &topology_path,
+                        layout.revision,
+                        &inventory,
+                        LayoutCommand::Replace { layout: migrated },
+                    )?;
+                    layout = crate::topology_store::load_state(&topology_path)?.layout;
+                } else {
+                    topology = layout.resolve(&inventory).map_err(anyhow::Error::msg)?;
+                }
+                let effects = session.replace_topology(&topology).map_err(anyhow::Error::msg)?;
+                execute_host_effects_multi(
+                    effects,
+                    &mut peers,
+                    &topology,
+                    injector.as_mut(),
+                    &events,
+                    LocalInputSources { current: None, held: &held_sources },
+                ).await?;
+                let device_id = TopologyDeviceId(host_peer.summary.device_id.to_string());
+                if let Some(previous) = peers.insert(device_id.clone(), host_peer) {
+                    previous.connection.close(0_u32.into(), b"replaced by a newer connection");
+                }
+                let connection = peers[&device_id].connection.clone();
+                let disconnected = disconnected_tx.clone();
+                let inventory_updates = inventory_tx.clone();
+                let inventory_device_id = device_id.clone();
+                tokio::spawn(async move {
+                    let _ = connection.closed().await;
+                    let _ = disconnected.send((device_id, remote)).await;
+                });
+                tokio::spawn(async move {
+                    loop {
+                        let screens = match read_reliable(&mut metadata).await {
+                            Ok(ReliableEvent::ScreenInventory { screens }) => {
+                                match validate_wire_screens(screens) {
+                                    Ok(screens) => screens,
+                                    Err(_) => break,
+                                }
+                            }
+                            _ => break,
+                        };
+                        if inventory_updates
+                            .send((inventory_device_id.clone(), remote, screens))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+                if capture.is_none() {
+                    injector = Some(InputInjector::new(&config.devices)?);
+                    capture = Some(platform::capture(config.devices.clone(), true)?);
+                    events.try_send(AppEvent::ControlChanged(ControlTarget::Local));
+                }
+                events.send(AppEvent::PeerChanged(Some(remote))).await;
+                events.send(AppEvent::TopologyChanged(topology.clone())).await;
+                publish_status(&events, RuntimeStatus::Connected).await;
+                tracing::info!(%remote, peers = peers.len(), "client connected");
             }
-            publish_status(&events, RuntimeStatus::Listening).await;
-            continue;
+            captured = next_host_capture(&mut capture) => {
+                let (source, event, released) = match captured? {
+                    CapturedEvent::Input { source, event, .. } => {
+                        let held = held_input(event);
+                        if matches!(input_state(event), Some(ButtonState::Pressed))
+                            && let Some(held) = held
+                        {
+                            held_sources.insert(held, source);
+                        }
+                        (source, SessionEvent::PhysicalInput(event),
+                         matches!(input_state(event), Some(ButtonState::Released)).then_some(held).flatten())
+                    }
+                    CapturedEvent::Motion { source, motion } => {
+                        (source, SessionEvent::PhysicalMotion(motion), None)
+                    }
+                };
+                execute_host_effects_multi(
+                    session.handle(event),
+                    &mut peers,
+                    &topology,
+                    injector.as_mut(),
+                    &events,
+                    LocalInputSources { current: Some(source), held: &held_sources },
+                ).await?;
+                if let Some(held) = released { held_sources.remove(&held); }
+            }
+            Some((device_id, remote)) = disconnected_rx.recv() => {
+                let matches_current = peers
+                    .get(&device_id)
+                    .is_some_and(|peer| peer.connection.remote_address() == remote);
+                if !matches_current {
+                    continue;
+                }
+                peers.remove(&device_id);
+                for screen in inventory.screens.iter_mut().filter(|screen| screen.device_id == device_id) {
+                    screen.online = false;
+                }
+                crate::topology_store::save_inventory(&topology_path, &inventory)?;
+                layout = crate::topology_store::load_state(&topology_path)?.layout;
+                topology = layout.resolve(&inventory).map_err(anyhow::Error::msg)?;
+                let effects = session.replace_topology(&topology).map_err(anyhow::Error::msg)?;
+                execute_host_effects_multi(
+                    effects,
+                    &mut peers,
+                    &topology,
+                    injector.as_mut(),
+                    &events,
+                    LocalInputSources { current: None, held: &held_sources },
+                ).await?;
+                events.send(AppEvent::TopologyChanged(topology.clone())).await;
+                events.send(AppEvent::PeerChanged(peers.values().next().map(|peer| peer.connection.remote_address()))).await;
+                publish_status(&events, if peers.is_empty() { RuntimeStatus::Listening } else { RuntimeStatus::Connected }).await;
+            }
+            Some((device_id, remote, screens)) = inventory_rx.recv() => {
+                let Some(peer) = peers.get(&device_id) else { continue };
+                if peer.connection.remote_address() != remote {
+                    continue;
+                }
+                merge_remote_inventory(&mut inventory, &peer.summary, &screens);
+                crate::topology_store::save_inventory(&topology_path, &inventory)?;
+                layout = crate::topology_store::load_state(&topology_path)?.layout;
+                topology = layout.resolve(&inventory).map_err(anyhow::Error::msg)?;
+                let effects = session.replace_topology(&topology).map_err(anyhow::Error::msg)?;
+                execute_host_effects_multi(
+                    effects,
+                    &mut peers,
+                    &topology,
+                    injector.as_mut(),
+                    &events,
+                    LocalInputSources { current: None, held: &held_sources },
+                ).await?;
+                events.send(AppEvent::TopologyChanged(topology.clone())).await;
+            }
+            Some(device_id) = forgotten_peers.recv() => {
+                let device_id = TopologyDeviceId(device_id.to_string());
+                if let Some(peer) = peers.remove(&device_id) {
+                    peer.connection.close(0_u32.into(), b"peer trust was removed");
+                }
+                for screen in inventory.screens.iter_mut().filter(|screen| screen.device_id == device_id) {
+                    screen.online = false;
+                }
+                crate::topology_store::save_inventory(&topology_path, &inventory)?;
+                layout = crate::topology_store::load_state(&topology_path)?.layout;
+                topology = layout.resolve(&inventory).map_err(anyhow::Error::msg)?;
+                let effects = session.replace_topology(&topology).map_err(anyhow::Error::msg)?;
+                execute_host_effects_multi(
+                    effects,
+                    &mut peers,
+                    &topology,
+                    injector.as_mut(),
+                    &events,
+                    LocalInputSources { current: None, held: &held_sources },
+                ).await?;
+                events.send(AppEvent::TopologyChanged(topology.clone())).await;
+            }
+            _ = heartbeat.tick() => {
+                if let Ok(refreshed) = platform::screens()
+                    && !refreshed.is_empty()
+                    && wire_screens(&refreshed) != wire_screens(&detected_screens)
+                {
+                    detected_screens = refreshed;
+                    merge_local_inventory(
+                        &mut inventory,
+                        &config.device_name,
+                        local_device_id,
+                        &detected_screens,
+                    );
+                    crate::topology_store::save_inventory(&topology_path, &inventory)?;
+                    layout = crate::topology_store::load_state(&topology_path)?.layout;
+                    topology = layout.resolve(&inventory).map_err(anyhow::Error::msg)?;
+                    let effects = session.replace_topology(&topology).map_err(anyhow::Error::msg)?;
+                    execute_host_effects_multi(
+                        effects,
+                        &mut peers,
+                        &topology,
+                        injector.as_mut(),
+                        &events,
+                        LocalInputSources { current: None, held: &held_sources },
+                    ).await?;
+                    let screens = wire_screens(&detected_screens);
+                    for peer in peers.values_mut() {
+                        write_reliable(
+                            &mut peer.reliable,
+                            &ReliableEvent::ScreenInventory { screens: screens.clone() },
+                        ).await?;
+                    }
+                    events.send(AppEvent::TopologyChanged(topology.clone())).await;
+                }
+                for peer in peers.values_mut() {
+                    peer.heartbeat_sequence = peer.heartbeat_sequence.wrapping_add(1);
+                    write_reliable(
+                        &mut peer.reliable,
+                        &ReliableEvent::Heartbeat { sequence: peer.heartbeat_sequence },
+                    ).await?;
+                }
+            }
+            changed = topology_updates.changed() => {
+                changed.context("topology update channel closed")?;
+                topology = topology_updates.borrow_and_update().clone();
+                layout = crate::topology_store::load_state(&topology_path)?.layout;
+                let effects = session.replace_topology(&topology).map_err(anyhow::Error::msg)?;
+                execute_host_effects_multi(
+                    effects,
+                    &mut peers,
+                    &topology,
+                    injector.as_mut(),
+                    &events,
+                    LocalInputSources { current: None, held: &held_sources },
+                ).await?;
+            }
+            _ = wait_for_stop(&mut stop) => break,
         }
-        events.send(AppEvent::PeerChanged(Some(remote))).await;
-        publish_status(&events, RuntimeStatus::Connected).await;
-        tracing::info!(%remote, "client connected");
-        return run_host_connection(connection, size, config.devices, direction, stop, events)
-            .await;
     }
+
+    if let Some(injector) = injector.as_mut() {
+        execute_host_effects_multi(
+            session.handle(SessionEvent::StopRequested),
+            &mut peers,
+            &topology,
+            Some(injector),
+            &events,
+            LocalInputSources {
+                current: None,
+                held: &held_sources,
+            },
+        )
+        .await?;
+    }
+    for peer in peers.into_values() {
+        peer.connection.close(0_u32.into(), b"host stopped");
+    }
+    for screen in inventory
+        .screens
+        .iter_mut()
+        .filter(|screen| !screen.this_device)
+    {
+        screen.online = false;
+    }
+    crate::topology_store::save_inventory(&topology_path, &inventory)?;
+    events
+        .send(AppEvent::TopologyChanged(
+            layout.resolve(&inventory).map_err(anyhow::Error::msg)?,
+        ))
+        .await;
+    Ok(())
+}
+
+async fn mark_peer_offline(device_id: DeviceId, events: &AppEventBus) {
+    let result: Result<ScreenTopology> = (|| {
+        let path = crate::topology_store::default_path()?;
+        let state = crate::topology_store::load_state(&path)?;
+        let mut inventory = state.inventory;
+        let device_id = TopologyDeviceId(device_id.to_string());
+        for screen in inventory
+            .screens
+            .iter_mut()
+            .filter(|screen| screen.device_id == device_id)
+        {
+            screen.online = false;
+        }
+        crate::topology_store::save_inventory(&path, &inventory)?;
+        state.layout.resolve(&inventory).map_err(anyhow::Error::msg)
+    })();
+    match result {
+        Ok(topology) => events.send(AppEvent::TopologyChanged(topology)).await,
+        Err(error) => events.send(AppEvent::Faulted(classify_fault(&error))).await,
+    }
+}
+
+struct HostPeer {
+    summary: PeerSummary,
+    connection: Connection,
+    reliable: SendStream,
+    reliable_sequence: u64,
+    heartbeat_sequence: u64,
+}
+
+async fn prepare_host_peer(
+    connection: Connection,
+    summary: PeerSummary,
+    local_screens: &[platform::DetectedScreen],
+    stop: &mut watch::Receiver<bool>,
+) -> Result<(HostPeer, Vec<WireScreenDescriptor>, RecvStream)> {
+    let mut metadata = tokio::select! {
+        stream = connection.accept_uni() => stream.context("accept client metadata stream")?,
+        _ = wait_for_stop(stop) => bail!("host stopped during peer setup"),
+    };
+    let screens = match read_reliable(&mut metadata).await? {
+        ReliableEvent::ClientHello {
+            version: PROTOCOL_VERSION,
+            screens,
+        } => validate_wire_screens(screens)?,
+        ReliableEvent::ClientHello { version, .. } => {
+            bail!("unsupported client protocol version {version}")
+        }
+        _ => bail!("first client message must be ClientHello"),
+    };
+    let mut reliable = connection
+        .open_uni()
+        .await
+        .context("open host input stream")?;
+    write_reliable(
+        &mut reliable,
+        &ReliableEvent::Hello {
+            version: PROTOCOL_VERSION,
+            screens: wire_screens(local_screens),
+        },
+    )
+    .await?;
+    Ok((
+        HostPeer {
+            summary,
+            connection,
+            reliable,
+            reliable_sequence: 0,
+            heartbeat_sequence: 0,
+        },
+        screens,
+        metadata,
+    ))
+}
+
+async fn next_host_capture(capture: &mut Option<platform::InputCapture>) -> Result<CapturedEvent> {
+    match capture {
+        Some(capture) => capture.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn execute_host_effects_multi(
+    effects: Vec<SessionEffect>,
+    peers: &mut HashMap<TopologyDeviceId, HostPeer>,
+    topology: &ScreenTopology,
+    mut local: Option<&mut InputInjector>,
+    events: &AppEventBus,
+    sources: LocalInputSources<'_>,
+) -> Result<()> {
+    for effect in effects {
+        match effect {
+            SessionEffect::InjectLocal(event) => {
+                let local = local
+                    .as_deref_mut()
+                    .context("local input injector is unavailable")?;
+                let source = local_event_source(event, sources.current, sources.held);
+                local.emit(source, event)?;
+            }
+            SessionEffect::InjectLocalMotion { dx, dy } => {
+                local
+                    .as_deref_mut()
+                    .context("local input injector is unavailable")?
+                    .emit_motion(sources.current.unwrap_or(0), dx, dy)?;
+            }
+            SessionEffect::SetLocalCursor { x, y } => {
+                local
+                    .as_deref_mut()
+                    .context("local input injector is unavailable")?
+                    .set_cursor_position(x, y)?;
+            }
+            SessionEffect::SendScreen { screen_id, event } => {
+                let peer = peer_for_screen(peers, topology, &screen_id)?;
+                peer.reliable_sequence = peer.reliable_sequence.wrapping_add(1);
+                write_reliable(
+                    &mut peer.reliable,
+                    &encode_input(peer.reliable_sequence, event)?,
+                )
+                .await?;
+            }
+            SessionEffect::SendScreenMotion { screen_id, motion } => {
+                let peer = peer_for_screen(peers, topology, &screen_id)?;
+                peer.connection
+                    .send_datagram(Bytes::from(encode(&MotionDto::from(motion))?))
+                    .context("send remote pointer motion")?;
+            }
+            SessionEffect::EnterScreen { screen_id, x, y } => {
+                let peer = peer_for_screen(peers, topology, &screen_id)?;
+                write_reliable(&mut peer.reliable, &ReliableEvent::EnterScreen { x, y }).await?;
+            }
+            SessionEffect::ReleaseScreen { screen_id } => {
+                if let Ok(peer) = peer_for_screen(peers, topology, &screen_id) {
+                    write_reliable(&mut peer.reliable, &ReliableEvent::ReleaseAll).await?;
+                }
+            }
+            SessionEffect::SendRemote(event) => {
+                let peer = only_peer(peers)?;
+                peer.reliable_sequence = peer.reliable_sequence.wrapping_add(1);
+                write_reliable(
+                    &mut peer.reliable,
+                    &encode_input(peer.reliable_sequence, event)?,
+                )
+                .await?;
+            }
+            SessionEffect::SendRemoteMotion(motion) => {
+                only_peer(peers)?
+                    .connection
+                    .send_datagram(Bytes::from(encode(&MotionDto::from(motion))?))
+                    .context("send remote pointer motion")?;
+            }
+            SessionEffect::EnterRemote { x, y } => {
+                write_reliable(
+                    &mut only_peer(peers)?.reliable,
+                    &ReliableEvent::EnterScreen { x, y },
+                )
+                .await?;
+            }
+            SessionEffect::ReleaseRemote => {
+                if peers.len() == 1 {
+                    write_reliable(&mut only_peer(peers)?.reliable, &ReliableEvent::ReleaseAll)
+                        .await?;
+                }
+            }
+            SessionEffect::ControlChanged(control) => {
+                events.try_send(AppEvent::ControlChanged(control));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn peer_for_screen<'a>(
+    peers: &'a mut HashMap<TopologyDeviceId, HostPeer>,
+    topology: &ScreenTopology,
+    screen_id: &ScreenId,
+) -> Result<&'a mut HostPeer> {
+    let device_id = topology
+        .screens
+        .iter()
+        .find(|screen| &screen.screen_id == screen_id)
+        .with_context(|| format!("screen {} is not in the active topology", screen_id.0))?
+        .device_id
+        .clone();
+    peers
+        .get_mut(&device_id)
+        .with_context(|| format!("device {} is not connected", device_id.0))
+}
+
+fn only_peer(peers: &mut HashMap<TopologyDeviceId, HostPeer>) -> Result<&mut HostPeer> {
+    if peers.len() != 1 {
+        bail!("legacy remote effect requires exactly one connected peer");
+    }
+    Ok(peers.values_mut().next().expect("peer count checked"))
 }
 
 async fn authorize_host_peer(
@@ -701,13 +1244,13 @@ async fn authorize_host_peer(
     decisions: &mut mpsc::Receiver<PairingDecision>,
     stop: &mut watch::Receiver<bool>,
     events: &AppEventBus,
-) -> Result<bool> {
+) -> Result<Option<PeerSummary>> {
     let remote = connection.remote_address();
     let peer_certificate = transport::peer_certificate(connection)?;
     let local_certificate = fs::read(&config.cert).context("read host identity certificate")?;
     let (mut send, mut receive) = tokio::select! {
         stream = connection.accept_bi() => stream.context("accept pairing stream")?,
-        _ = wait_for_stop(stop) => return Ok(false),
+        _ = wait_for_stop(stop) => return Ok(None),
     };
     let client_message: PairingMessage = read_typed_frame(&mut receive).await?;
     let (client_name, client_material) =
@@ -733,12 +1276,15 @@ async fn authorize_host_peer(
         write_typed_frame(&mut send, &PairingMessage::Accepted).await?;
         expect_pairing_acknowledgement(&mut receive).await?;
         send.finish().context("finish pairing stream")?;
-        return Ok(true);
+        return Ok(Some(PeerSummary {
+            device_id: DeviceId::from_certificate(&client_material.certificate),
+            display_name: client_name.clone(),
+        }));
     }
 
     if !rate_limiter.allow(remote.ip(), tokio::time::Instant::now()) {
         let _ = write_typed_frame(&mut send, &PairingMessage::Rejected).await;
-        return Ok(false);
+        return Ok(None);
     }
 
     let request = PairingRequestSummary {
@@ -782,7 +1328,7 @@ async fn authorize_host_peer(
         .await;
     if outcome != PairingOutcome::Accepted {
         let _ = write_typed_frame(&mut send, &PairingMessage::Rejected).await;
-        return Ok(false);
+        return Ok(None);
     }
     let device_id = trust.remember(
         client_name.clone(),
@@ -794,11 +1340,14 @@ async fn authorize_host_peer(
     events
         .send(AppEvent::PeerTrusted(PeerSummary {
             device_id,
-            display_name: client_name,
+            display_name: client_name.clone(),
         }))
         .await;
     send.finish().context("finish pairing stream")?;
-    Ok(true)
+    Ok(Some(PeerSummary {
+        device_id,
+        display_name: client_name,
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -888,158 +1437,6 @@ fn unix_timestamp() -> Result<u64> {
         .as_secs())
 }
 
-async fn run_host_connection(
-    connection: Connection,
-    local_size: ScreenSize,
-    devices: Vec<PathBuf>,
-    direction: ScreenDirection,
-    mut stop: watch::Receiver<bool>,
-    events: AppEventBus,
-) -> Result<()> {
-    let mut metadata = tokio::select! {
-        stream = connection.accept_uni() => stream.context("accept client metadata stream")?,
-        _ = wait_for_stop(&mut stop) => return Ok(()),
-    };
-    let remote_size = match read_reliable(&mut metadata).await? {
-        ReliableEvent::ClientHello {
-            version: PROTOCOL_VERSION,
-            width,
-            height,
-        } => ScreenSize::new(width, height).map_err(anyhow::Error::msg)?,
-        ReliableEvent::ClientHello { version, .. } => {
-            bail!("unsupported client protocol version {version}")
-        }
-        _ => bail!("first client message must be ClientHello"),
-    };
-    let mut remote_stream = connection
-        .open_uni()
-        .await
-        .context("open host input stream")?;
-    write_reliable(
-        &mut remote_stream,
-        &ReliableEvent::Hello {
-            version: PROTOCOL_VERSION,
-        },
-    )
-    .await?;
-
-    let mut session = DesktopSession::host(local_size, remote_size, direction);
-    events.try_send(AppEvent::ControlChanged(ControlTarget::Local));
-    let mut injector = InputInjector::new(&devices)?;
-    if let Some((x, y)) = platform::cursor_position() {
-        session.set_local_position(x, y);
-    }
-    let mut capture = platform::capture(devices, true)?;
-    let mut held_sources = HashMap::new();
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
-    let mut heartbeat_sequence = 0_u64;
-    let mut reliable_sequence = 0_u64;
-
-    let result: Result<()> = async {
-        loop {
-            tokio::select! {
-                captured = capture.next() => {
-                    let (source, event, released) = match captured? {
-                        CapturedEvent::Input { source, event, .. } => {
-                            let held = held_input(event);
-                            if matches!(input_state(event), Some(ButtonState::Pressed))
-                                && let Some(held) = held
-                            {
-                                held_sources.insert(held, source);
-                            }
-                            (source, SessionEvent::PhysicalInput(event),
-                             matches!(input_state(event), Some(ButtonState::Released)).then_some(held).flatten())
-                        }
-                        CapturedEvent::Motion { source, motion } => {
-                            (source, SessionEvent::PhysicalMotion(motion), None)
-                        }
-                    };
-                    execute_host_effects(
-                        session.handle(event),
-                        &connection,
-                        &mut remote_stream,
-                        &mut injector,
-                        &events,
-                        &mut reliable_sequence,
-                        LocalInputSources { current: Some(source), held: &held_sources },
-                    ).await?;
-                    if let Some(held) = released { held_sources.remove(&held); }
-                }
-                _ = heartbeat.tick() => {
-                    heartbeat_sequence = heartbeat_sequence.wrapping_add(1);
-                    write_reliable(&mut remote_stream, &ReliableEvent::Heartbeat { sequence: heartbeat_sequence }).await?;
-                }
-                closed = connection.closed() => bail!("client connection closed: {closed}"),
-                _ = wait_for_stop(&mut stop) => break,
-            }
-        }
-        Ok(())
-    }.await;
-
-    let cleanup = execute_host_effects(
-        session.handle(if result.is_ok() {
-            SessionEvent::StopRequested
-        } else {
-            SessionEvent::PeerDisconnected
-        }),
-        &connection,
-        &mut remote_stream,
-        &mut injector,
-        &events,
-        &mut reliable_sequence,
-        LocalInputSources {
-            current: None,
-            held: &held_sources,
-        },
-    )
-    .await;
-    connection.close(0_u32.into(), b"host stopped");
-    cleanup?;
-    result
-}
-
-async fn execute_host_effects(
-    effects: Vec<SessionEffect>,
-    connection: &Connection,
-    remote: &mut SendStream,
-    local: &mut InputInjector,
-    events: &AppEventBus,
-    sequence: &mut u64,
-    sources: LocalInputSources<'_>,
-) -> Result<()> {
-    for effect in effects {
-        match effect {
-            SessionEffect::InjectLocal(event) => {
-                let source = local_event_source(event, sources.current, sources.held);
-                local.emit(source, event)?;
-            }
-            SessionEffect::InjectLocalMotion { dx, dy } => {
-                local.emit_motion(sources.current.unwrap_or(0), dx, dy)?;
-            }
-            SessionEffect::SendRemote(event) => {
-                *sequence = sequence.wrapping_add(1);
-                write_reliable(remote, &encode_input(*sequence, event)?).await?;
-            }
-            SessionEffect::SendRemoteMotion(motion) => {
-                connection
-                    .send_datagram(Bytes::from(encode(&MotionDto::from(motion))?))
-                    .context("send remote pointer motion")?;
-            }
-            SessionEffect::EnterRemote { x, y } => {
-                write_reliable(remote, &ReliableEvent::EnterScreen { x, y }).await?;
-            }
-            SessionEffect::SetLocalCursor { x, y } => local.set_cursor_position(x, y)?,
-            SessionEffect::ReleaseRemote => {
-                write_reliable(remote, &ReliableEvent::ReleaseAll).await?;
-            }
-            SessionEffect::ControlChanged(control) => {
-                events.try_send(AppEvent::ControlChanged(control));
-            }
-        }
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy)]
 struct LocalInputSources<'a> {
     current: Option<usize>,
@@ -1101,12 +1498,19 @@ async fn run_client(
     let local_device_id = DeviceId::from_certificate(
         &fs::read(&config.identity_cert).context("read client identity certificate")?,
     );
-    let topology = reconcile_discovered_topology(
-        crate::topology_store::load(&crate::topology_store::default_path()?)?,
+    let topology_path = crate::topology_store::default_path()?;
+    let state = crate::topology_store::load_state(&topology_path)?;
+    let inventory = reconcile_discovered_inventory(
+        state.inventory,
         &config.device_name,
         local_device_id,
-        detected_screens,
+        &detected_screens,
     );
+    crate::topology_store::save_inventory(&topology_path, &inventory)?;
+    let topology = state
+        .layout
+        .resolve(&inventory)
+        .map_err(anyhow::Error::msg)?;
     events.send(AppEvent::TopologyChanged(topology)).await;
     let endpoint = transport::pairing_client_endpoint(SocketAddr::new(bind_ip, 0), &identity)?;
     let mut trust = TrustStore::load(&config.trust_store)?;
@@ -1124,9 +1528,12 @@ async fn run_client(
             target,
             &config,
             &mut trust,
-            stop.clone(),
-            events.clone(),
-            diagnostics.clone(),
+            ClientAttempt {
+                stop: stop.clone(),
+                events: events.clone(),
+                diagnostics: diagnostics.clone(),
+                detected_screens: detected_screens.clone(),
+            },
         )
         .await;
         match result {
@@ -1150,44 +1557,190 @@ async fn run_client(
     }
 }
 
-fn reconcile_discovered_topology(
-    saved: Option<ScreenTopology>,
+fn reconcile_discovered_inventory(
+    mut inventory: ScreenInventory,
     device_name: &str,
     device_id: DeviceId,
-    screens: Vec<platform::DetectedScreen>,
-) -> ScreenTopology {
-    let device_id = TopologyDeviceId(device_id.to_string());
-    let mut topology = saved.unwrap_or_default();
-    for node in &mut topology.screens {
+    screens: &[platform::DetectedScreen],
+) -> ScreenInventory {
+    for node in &mut inventory.screens {
         node.online = false;
         node.this_device = false;
     }
+    merge_local_inventory(&mut inventory, device_name, device_id, screens);
+    inventory
+}
+
+fn merge_local_inventory(
+    inventory: &mut ScreenInventory,
+    device_name: &str,
+    device_id: DeviceId,
+    screens: &[platform::DetectedScreen],
+) {
+    let device_id = TopologyDeviceId(device_id.to_string());
+    for node in inventory
+        .screens
+        .iter_mut()
+        .filter(|node| node.device_id == device_id)
+    {
+        node.online = false;
+        node.this_device = true;
+    }
     for screen in screens {
         let screen_id = ScreenId(format!("{}/{}", device_id.0, screen.stable_id));
-        if let Some(node) = topology
+        if let Some(node) = inventory
             .screens
             .iter_mut()
             .find(|node| node.screen_id == screen_id && node.device_id == device_id)
         {
             node.device_name = device_name.to_owned();
-            node.name = screen.name;
+            node.name = screen.name.clone();
             node.logical_size = screen.logical_size;
             node.online = true;
             node.this_device = true;
         } else {
-            topology.screens.push(ScreenNode {
+            inventory.screens.push(ScreenDescriptor {
                 screen_id,
                 device_id: device_id.clone(),
                 device_name: device_name.to_owned(),
-                name: screen.name,
+                name: screen.name.clone(),
                 logical_size: screen.logical_size,
-                size_override: None,
+                primary: screen.primary,
                 online: true,
                 this_device: true,
             });
         }
     }
-    topology
+}
+
+fn wire_screens(screens: &[platform::DetectedScreen]) -> Vec<WireScreenDescriptor> {
+    screens
+        .iter()
+        .map(|screen| WireScreenDescriptor {
+            stable_id: screen.stable_id.clone(),
+            name: screen.name.clone(),
+            width: screen.logical_size.width,
+            height: screen.logical_size.height,
+            primary: screen.primary,
+        })
+        .collect()
+}
+
+fn validate_wire_screens(screens: Vec<WireScreenDescriptor>) -> Result<Vec<WireScreenDescriptor>> {
+    if screens.is_empty() || screens.len() > 64 {
+        bail!("peer must report between 1 and 64 screens");
+    }
+    let mut ids = std::collections::HashSet::new();
+    for screen in &screens {
+        if screen.stable_id.trim().is_empty()
+            || screen.stable_id.len() > 256
+            || screen.name.trim().is_empty()
+            || screen.name.len() > 256
+        {
+            bail!("peer screen IDs and names must contain 1 to 256 bytes");
+        }
+        if !ids.insert(&screen.stable_id) {
+            bail!("peer reported duplicate screen ID {}", screen.stable_id);
+        }
+        ScreenSize::new(screen.width, screen.height).map_err(anyhow::Error::msg)?;
+    }
+    Ok(screens)
+}
+
+fn merge_remote_inventory(
+    inventory: &mut ScreenInventory,
+    peer: &PeerSummary,
+    screens: &[WireScreenDescriptor],
+) {
+    let device_id = TopologyDeviceId(peer.device_id.to_string());
+    for screen in inventory
+        .screens
+        .iter_mut()
+        .filter(|screen| screen.device_id == device_id)
+    {
+        screen.online = false;
+        screen.this_device = false;
+    }
+    for screen in screens {
+        let screen_id = ScreenId(format!("{}/{}", device_id.0, screen.stable_id));
+        let logical_size = ScreenSize::new(screen.width, screen.height)
+            .expect("wire screens are validated before inventory merge");
+        if let Some(existing) = inventory
+            .screens
+            .iter_mut()
+            .find(|existing| existing.screen_id == screen_id)
+        {
+            existing.device_id = device_id.clone();
+            existing.device_name = peer.display_name.clone();
+            existing.name = screen.name.clone();
+            existing.logical_size = logical_size;
+            existing.primary = screen.primary;
+            existing.online = true;
+            existing.this_device = false;
+        } else {
+            inventory.screens.push(ScreenDescriptor {
+                screen_id,
+                device_id: device_id.clone(),
+                device_name: peer.display_name.clone(),
+                name: screen.name.clone(),
+                logical_size,
+                primary: screen.primary,
+                online: true,
+                this_device: false,
+            });
+        }
+    }
+}
+
+fn migrate_legacy_direction(
+    layout: &crate::core::ScreenLayout,
+    inventory: &ScreenInventory,
+    direction: ScreenDirection,
+) -> Result<crate::core::ScreenLayout> {
+    let local = inventory
+        .screens
+        .iter()
+        .find(|screen| screen.this_device && screen.primary)
+        .or_else(|| inventory.screens.iter().find(|screen| screen.this_device))
+        .context("cannot migrate direction without a local screen")?;
+    let remotes: Vec<_> = inventory
+        .screens
+        .iter()
+        .filter(|screen| !screen.this_device && screen.online)
+        .collect();
+    let [remote] = remotes.as_slice() else {
+        bail!("legacy --direction migration requires exactly one online remote screen")
+    };
+    let position = match direction {
+        ScreenDirection::Left => crate::core::RelativePosition::LeftOf,
+        ScreenDirection::Right => crate::core::RelativePosition::RightOf,
+        ScreenDirection::Top => crate::core::RelativePosition::Above,
+        ScreenDirection::Bottom => crate::core::RelativePosition::Below,
+        ScreenDirection::TopRight
+        | ScreenDirection::BottomRight
+        | ScreenDirection::BottomLeft
+        | ScreenDirection::TopLeft => {
+            bail!("diagonal --direction cannot be migrated to edge topology")
+        }
+    };
+    layout
+        .apply(
+            inventory,
+            LayoutCommand::Place {
+                screen_id: remote.screen_id.clone(),
+                anchor_id: local.screen_id.clone(),
+                position,
+                replace: false,
+            },
+        )
+        .map_err(anyhow::Error::msg)
+}
+
+struct ClientAttempt {
+    stop: watch::Receiver<bool>,
+    events: AppEventBus,
+    diagnostics: Arc<dyn DiagnosticSink>,
+    detected_screens: Vec<platform::DetectedScreen>,
 }
 
 async fn run_client_once(
@@ -1195,21 +1748,24 @@ async fn run_client_once(
     remote: SocketAddr,
     config: &ClientConfig,
     trust: &mut TrustStore,
-    mut stop: watch::Receiver<bool>,
-    events: AppEventBus,
-    diagnostics: Arc<dyn DiagnosticSink>,
+    attempt: ClientAttempt,
 ) -> Result<()> {
-    let size = config
-        .size
-        .context("client screen size was not resolved before connection")?;
+    let ClientAttempt {
+        mut stop,
+        events,
+        diagnostics,
+        detected_screens,
+    } = attempt;
     let connection = tokio::select! {
         connection = transport::connect(endpoint, remote) => connection?,
         _ = wait_for_stop(&mut stop) => return Ok(()),
     };
-    if !authorize_server_peer(&connection, config, trust, &events, &mut stop).await? {
+    let Some(server_peer) =
+        authorize_server_peer(&connection, config, trust, &events, &mut stop).await?
+    else {
         return Ok(());
-    }
-    tracing::info!(%remote, width = size.width, height = size.height, "connected to host");
+    };
+    tracing::info!(%remote, screens = detected_screens.len(), "connected to host");
     events.send(AppEvent::PeerChanged(Some(remote))).await;
     events.try_send(AppEvent::ControlChanged(ControlTarget::Remote));
     publish_status(&events, RuntimeStatus::Connected).await;
@@ -1222,24 +1778,71 @@ async fn run_client_once(
         &mut metadata,
         &ReliableEvent::ClientHello {
             version: PROTOCOL_VERSION,
-            width: size.width,
-            height: size.height,
+            screens: wire_screens(&detected_screens),
         },
     )
     .await?;
-    metadata.finish()?;
     let mut stream = connection
         .accept_uni()
         .await
         .context("accept host input stream")?;
-    match read_reliable(&mut stream).await? {
+    let host_screens = match read_reliable(&mut stream).await? {
         ReliableEvent::Hello {
             version: PROTOCOL_VERSION,
-        } => {}
-        ReliableEvent::Hello { version } => bail!("unsupported host protocol version {version}"),
+            screens,
+        } => validate_wire_screens(screens)?,
+        ReliableEvent::Hello { version, .. } => {
+            bail!("unsupported host protocol version {version}")
+        }
         _ => bail!("first host message must be Hello"),
+    };
+    let topology_path = crate::topology_store::default_path()?;
+    let state = crate::topology_store::load_state(&topology_path)?;
+    let mut inventory = state.inventory;
+    merge_remote_inventory(&mut inventory, &server_peer, &host_screens);
+    crate::topology_store::save_inventory(&topology_path, &inventory)?;
+    events
+        .send(AppEvent::TopologyChanged(
+            state
+                .layout
+                .resolve(&inventory)
+                .map_err(anyhow::Error::msg)?,
+        ))
+        .await;
+    let result = run_client_connection(
+        connection,
+        stream,
+        ClientConnectionContext {
+            metadata,
+            known_screens: wire_screens(&detected_screens),
+            server_peer: server_peer.clone(),
+            topology_path: topology_path.clone(),
+            stop,
+            events: events.clone(),
+            diagnostics,
+        },
+    )
+    .await;
+    let state = crate::topology_store::load_state(&topology_path)?;
+    let mut inventory = state.inventory;
+    let server_device_id = TopologyDeviceId(server_peer.device_id.to_string());
+    for screen in inventory
+        .screens
+        .iter_mut()
+        .filter(|screen| screen.device_id == server_device_id)
+    {
+        screen.online = false;
     }
-    run_client_connection(connection, stream, stop, diagnostics).await
+    crate::topology_store::save_inventory(&topology_path, &inventory)?;
+    events
+        .send(AppEvent::TopologyChanged(
+            state
+                .layout
+                .resolve(&inventory)
+                .map_err(anyhow::Error::msg)?,
+        ))
+        .await;
+    result
 }
 
 async fn authorize_server_peer(
@@ -1248,7 +1851,7 @@ async fn authorize_server_peer(
     trust: &mut TrustStore,
     events: &AppEventBus,
     stop: &mut watch::Receiver<bool>,
-) -> Result<bool> {
+) -> Result<Option<PeerSummary>> {
     let remote = connection.remote_address();
     let peer_certificate = transport::peer_certificate(connection)?;
     let local_certificate =
@@ -1262,7 +1865,7 @@ async fn authorize_server_peer(
     .await?;
     let server_message: PairingMessage = tokio::select! {
         message = read_typed_frame(&mut receive) => message?,
-        _ = wait_for_stop(stop) => return Ok(false),
+        _ = wait_for_stop(stop) => return Ok(None),
     };
     let (server_name, server_material) =
         validate_pairing_hello(server_message, PairingRole::Server, peer_certificate)?;
@@ -1304,7 +1907,7 @@ async fn authorize_server_peer(
     let decision: PairingMessage = tokio::select! {
         message = read_typed_frame(&mut receive) => message?,
         _ = tokio::time::sleep(PAIRING_REQUEST_LIFETIME) => bail!("pairing request expired"),
-        _ = wait_for_stop(stop) => return Ok(false),
+        _ = wait_for_stop(stop) => return Ok(None),
     };
     if matches!(verification, VerifyPeer::Unknown(_)) {
         events
@@ -1318,7 +1921,7 @@ async fn authorize_server_peer(
             bail!("server sent an invalid pairing decision")
         }
     }
-    if matches!(verification, VerifyPeer::Unknown(_)) {
+    let device_id = if matches!(verification, VerifyPeer::Unknown(_)) {
         let device_id = trust.remember(
             server_name.clone(),
             &server_material.certificate,
@@ -1328,26 +1931,68 @@ async fn authorize_server_peer(
         events
             .send(AppEvent::PeerTrusted(PeerSummary {
                 device_id,
-                display_name: server_name,
+                display_name: server_name.clone(),
             }))
             .await;
-    }
+        device_id
+    } else {
+        DeviceId::from_certificate(&server_material.certificate)
+    };
     write_typed_frame(&mut send, &PairingMessage::Acknowledged).await?;
     send.finish().context("finish pairing acknowledgement")?;
-    Ok(true)
+    Ok(Some(PeerSummary {
+        device_id,
+        display_name: server_name,
+    }))
+}
+
+struct ClientConnectionContext {
+    metadata: SendStream,
+    known_screens: Vec<WireScreenDescriptor>,
+    server_peer: PeerSummary,
+    topology_path: PathBuf,
+    stop: watch::Receiver<bool>,
+    events: AppEventBus,
+    diagnostics: Arc<dyn DiagnosticSink>,
 }
 
 async fn run_client_connection(
     connection: Connection,
     mut stream: RecvStream,
-    mut stop: watch::Receiver<bool>,
-    diagnostics: Arc<dyn DiagnosticSink>,
+    context: ClientConnectionContext,
 ) -> Result<()> {
+    let ClientConnectionContext {
+        mut metadata,
+        mut known_screens,
+        server_peer,
+        topology_path,
+        mut stop,
+        events,
+        diagnostics,
+    } = context;
     let mut injector = InputInjector::new(&[])?;
     let mut session = DesktopSession::client();
+    let mut inventory_poll = tokio::time::interval(Duration::from_secs(2));
+    inventory_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let result: Result<()> = async {
         loop {
             tokio::select! {
+                _ = inventory_poll.tick() => {
+                    let current = match platform::screens() {
+                        Ok(screens) => wire_screens(&screens),
+                        Err(error) => {
+                            tracing::warn!(%error, "could not refresh local screen inventory");
+                            continue;
+                        }
+                    };
+                    if current != known_screens {
+                        write_reliable(
+                            &mut metadata,
+                            &ReliableEvent::ScreenInventory { screens: current.clone() },
+                        ).await?;
+                        known_screens = current;
+                    }
+                }
                 datagram = connection.read_datagram() => {
                     let bytes = datagram.context("read pointer datagram")?;
                     let motion: MotionDto = decode(&bytes)?;
@@ -1378,7 +2023,18 @@ async fn run_client_connection(
                         )?;
                     }
                     ReliableEvent::Heartbeat { .. } => {}
-                    ReliableEvent::Hello { .. } | ReliableEvent::ClientHello { .. } => {
+                    ReliableEvent::ScreenInventory { screens } => {
+                        let screens = validate_wire_screens(screens)?;
+                        let state = crate::topology_store::load_state(&topology_path)?;
+                        let mut inventory = state.inventory;
+                        merge_remote_inventory(&mut inventory, &server_peer, &screens);
+                        crate::topology_store::save_inventory(&topology_path, &inventory)?;
+                        events.send(AppEvent::TopologyChanged(
+                            state.layout.resolve(&inventory).map_err(anyhow::Error::msg)?,
+                        )).await;
+                    }
+                    ReliableEvent::Hello { .. }
+                    | ReliableEvent::ClientHello { .. } => {
                         bail!("unexpected handshake message")
                     }
                 },
@@ -1410,6 +2066,10 @@ fn execute_client_effects(effects: Vec<SessionEffect>, injector: &mut InputInjec
             | SessionEffect::SendRemoteMotion(_)
             | SessionEffect::EnterRemote { .. }
             | SessionEffect::ReleaseRemote
+            | SessionEffect::SendScreen { .. }
+            | SessionEffect::SendScreenMotion { .. }
+            | SessionEffect::EnterScreen { .. }
+            | SessionEffect::ReleaseScreen { .. }
             | SessionEffect::ControlChanged(_) => {
                 bail!("host-only effect produced by client session")
             }
@@ -1567,7 +2227,7 @@ mod tests {
             panic!("expected classified fault")
         };
         assert_eq!(fault.kind, FaultKind::InvalidConfiguration);
-        assert!(fault.message.contains("pass --direction"));
+        assert!(fault.message.contains("identity certificate"));
         assert_eq!(
             runtime.snapshot(),
             RuntimeSnapshot {
@@ -1723,9 +2383,9 @@ mod tests {
             .unwrap();
         let (server_authorized, first_server_connection, first_server_endpoint) =
             server_task.await.unwrap();
-        assert!(server_authorized);
+        assert!(server_authorized.is_some());
         let (client_authorized, first_connection) = client_task.await.unwrap();
-        assert!(client_authorized);
+        assert!(client_authorized.is_some());
         first_connection.close(0_u32.into(), b"test pairing complete");
         first_server_connection.close(0_u32.into(), b"test pairing complete");
         first_server_endpoint.close(0_u32.into(), b"test pairing complete");
@@ -1810,7 +2470,7 @@ mod tests {
         });
         let (server_authorized, server_connection) = reconnect_server_task.await.unwrap();
         let (client_authorized, client_connection) = reconnect_client_task.await.unwrap();
-        assert!(server_authorized && client_authorized);
+        assert!(server_authorized.is_some() && client_authorized.is_some());
         assert!(matches!(
             reconnect_server_event_rx.try_recv(),
             Ok(AppEvent::PeerIdentified(PeerSummary { display_name, .. })) if display_name == "macmini"
@@ -1852,6 +2512,47 @@ mod tests {
         let held_sources = HashMap::from([(HeldInput::Key(key), 3)]);
 
         assert_eq!(local_event_source(event, Some(1), &held_sources), 3);
+    }
+
+    #[test]
+    fn refreshed_remote_inventory_marks_unplugged_screens_offline() {
+        let peer = PeerSummary {
+            device_id: DeviceId([7; 32]),
+            display_name: "peer".to_owned(),
+        };
+        let first = vec![
+            WireScreenDescriptor {
+                stable_id: "a".to_owned(),
+                name: "A".to_owned(),
+                width: 1920,
+                height: 1080,
+                primary: true,
+            },
+            WireScreenDescriptor {
+                stable_id: "b".to_owned(),
+                name: "B".to_owned(),
+                width: 1280,
+                height: 720,
+                primary: false,
+            },
+        ];
+        let mut inventory = ScreenInventory::default();
+        merge_remote_inventory(&mut inventory, &peer, &first);
+
+        merge_remote_inventory(&mut inventory, &peer, &first[..1]);
+
+        assert!(
+            inventory
+                .screens
+                .iter()
+                .any(|screen| { screen.screen_id.0.ends_with("/a") && screen.online })
+        );
+        assert!(
+            inventory
+                .screens
+                .iter()
+                .any(|screen| { screen.screen_id.0.ends_with("/b") && !screen.online })
+        );
     }
 
     #[test]

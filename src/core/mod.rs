@@ -7,7 +7,8 @@ pub use session::{
     ControlTarget, DesktopSession, HeldInput, SessionEffect, SessionEvent, SessionSnapshot,
 };
 pub use topology::{
-    Edge, ScreenDirection, ScreenDirectionParseError, ScreenEdge, ScreenId, ScreenLink, ScreenNode,
-    ScreenSize, ScreenSizeParseError, ScreenTopology, TopologyDeviceId, TopologyRoute,
-    TopologyRouter,
+    Edge, LayoutCommand, LayoutError, RelativePosition, ScreenDescriptor, ScreenDirection,
+    ScreenDirectionParseError, ScreenEdge, ScreenId, ScreenInventory, ScreenLayout, ScreenLink,
+    ScreenNode, ScreenSize, ScreenSizeOverride, ScreenSizeParseError, ScreenTopology,
+    TopologyDeviceId, TopologyRoute, TopologyRouter,
 };

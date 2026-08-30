@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
-use super::topology::{CursorRouter, Route, ScreenDirection, ScreenSize};
+use super::topology::{
+    CursorRouter, Route, ScreenDirection, ScreenId, ScreenSize, ScreenTopology, TopologyRoute,
+    TopologyRouter,
+};
 use super::{Button, ButtonState, InputEvent, Key, Motion};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,15 +39,40 @@ pub enum SessionEvent {
     StopRequested,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEffect {
     InjectLocal(InputEvent),
-    InjectLocalMotion { dx: i32, dy: i32 },
+    InjectLocalMotion {
+        dx: i32,
+        dy: i32,
+    },
     SendRemote(InputEvent),
     SendRemoteMotion(Motion),
-    EnterRemote { x: i32, y: i32 },
-    SetLocalCursor { x: i32, y: i32 },
+    EnterRemote {
+        x: i32,
+        y: i32,
+    },
+    SetLocalCursor {
+        x: i32,
+        y: i32,
+    },
     ReleaseRemote,
+    SendScreen {
+        screen_id: ScreenId,
+        event: InputEvent,
+    },
+    SendScreenMotion {
+        screen_id: ScreenId,
+        motion: Motion,
+    },
+    EnterScreen {
+        screen_id: ScreenId,
+        x: i32,
+        y: i32,
+    },
+    ReleaseScreen {
+        screen_id: ScreenId,
+    },
     ControlChanged(ControlTarget),
 }
 
@@ -57,7 +85,7 @@ pub struct SessionSnapshot {
 /// Pure input-routing state machine shared by host and client runtimes.
 pub struct DesktopSession {
     role: SessionRole,
-    router: Option<CursorRouter>,
+    router: Option<HostRouter>,
     control: ControlTarget,
     physical_held: BTreeSet<HeldInput>,
     local_injected: BTreeSet<HeldInput>,
@@ -71,17 +99,47 @@ enum SessionRole {
     Client,
 }
 
+enum HostRouter {
+    Legacy(CursorRouter),
+    Topology {
+        router: TopologyRouter,
+        local_screen: ScreenId,
+    },
+}
+
 impl DesktopSession {
     pub fn host(local: ScreenSize, remote: ScreenSize, direction: ScreenDirection) -> Self {
         Self {
             role: SessionRole::Host,
-            router: Some(CursorRouter::new(local, remote, direction)),
+            router: Some(HostRouter::Legacy(CursorRouter::new(
+                local, remote, direction,
+            ))),
             control: ControlTarget::Local,
             physical_held: BTreeSet::new(),
             local_injected: BTreeSet::new(),
             remote_injected: BTreeSet::new(),
             last_remote_motion: None,
         }
+    }
+
+    pub fn host_topology(
+        topology: &ScreenTopology,
+        local_screen: ScreenId,
+        x: i32,
+        y: i32,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            role: SessionRole::Host,
+            router: Some(HostRouter::Topology {
+                router: TopologyRouter::new(topology, local_screen.clone(), x, y)?,
+                local_screen,
+            }),
+            control: ControlTarget::Local,
+            physical_held: BTreeSet::new(),
+            local_injected: BTreeSet::new(),
+            remote_injected: BTreeSet::new(),
+            last_remote_motion: None,
+        })
     }
 
     pub fn client() -> Self {
@@ -98,7 +156,15 @@ impl DesktopSession {
 
     pub fn set_local_position(&mut self, x: i32, y: i32) {
         if let Some(router) = &mut self.router {
-            router.set_local_position(x, y);
+            match router {
+                HostRouter::Legacy(router) => router.set_local_position(x, y),
+                HostRouter::Topology {
+                    router,
+                    local_screen,
+                } => {
+                    let _ = router.set_position(local_screen.clone(), x, y);
+                }
+            }
             self.control = ControlTarget::Local;
         }
     }
@@ -107,6 +173,57 @@ impl DesktopSession {
         SessionSnapshot {
             control: self.control,
             held: self.physical_held.iter().copied().collect(),
+        }
+    }
+
+    pub fn replace_topology(
+        &mut self,
+        topology: &ScreenTopology,
+    ) -> Result<Vec<SessionEffect>, String> {
+        let Some(HostRouter::Topology {
+            router,
+            local_screen,
+        }) = &mut self.router
+        else {
+            return Err("session is not using topology routing".to_owned());
+        };
+        let active_remote = router.active_screen() != local_screen;
+        let active_screen = router.active_screen().clone();
+        let active_still_routable = topology
+            .screens
+            .iter()
+            .find(|screen| screen.screen_id == active_screen)
+            .is_some_and(|screen| screen.online)
+            && topology.links.iter().any(|link| {
+                link.from.screen_id == active_screen || link.to.screen_id == active_screen
+            });
+        if active_remote && !active_still_routable {
+            let local = topology
+                .screens
+                .iter()
+                .find(|screen| screen.screen_id == *local_screen && screen.online)
+                .ok_or_else(|| "no online local screen is available".to_owned())?;
+            let x = local.effective_size().width / 2;
+            let y = local.effective_size().height / 2;
+            router.replace_topology(topology)?;
+            router.set_position(local_screen.clone(), x, y)?;
+            self.control = ControlTarget::Local;
+            self.remote_injected.clear();
+            let mut effects = vec![
+                SessionEffect::ReleaseScreen {
+                    screen_id: active_screen.clone(),
+                },
+                SessionEffect::SetLocalCursor { x, y },
+            ];
+            for held in self.physical_held.iter().copied() {
+                self.local_injected.insert(held);
+                effects.push(SessionEffect::InjectLocal(held.event(ButtonState::Pressed)));
+            }
+            effects.push(SessionEffect::ControlChanged(ControlTarget::Local));
+            Ok(effects)
+        } else {
+            router.replace_topology(topology)?;
+            Ok(Vec::new())
         }
     }
 
@@ -159,7 +276,11 @@ impl DesktopSession {
             }
             ControlTarget::Remote => {
                 Self::observe_injected(&mut self.remote_injected, event);
-                vec![SessionEffect::SendRemote(event)]
+                if let Some(screen_id) = self.active_topology_screen() {
+                    vec![SessionEffect::SendScreen { screen_id, event }]
+                } else {
+                    vec![SessionEffect::SendRemote(event)]
+                }
             }
         }
     }
@@ -168,7 +289,35 @@ impl DesktopSession {
         let Some(router) = &mut self.router else {
             return Vec::new();
         };
-        match router.route_motion(motion.dx, motion.dy) {
+        if let HostRouter::Topology {
+            router,
+            local_screen,
+        } = router
+        {
+            let previous = router.active_screen().clone();
+            return match router.route_motion(motion.dx, motion.dy) {
+                TopologyRoute::Stay { screen_id, dx, dy } if screen_id == *local_screen => {
+                    vec![SessionEffect::InjectLocalMotion { dx, dy }]
+                }
+                TopologyRoute::Stay { screen_id, dx, dy } => {
+                    vec![SessionEffect::SendScreenMotion {
+                        screen_id,
+                        motion: Motion { dx, dy, ..motion },
+                    }]
+                }
+                TopologyRoute::Cross { screen_id, x, y } if screen_id == *local_screen => {
+                    self.enter_local_from_screen(previous, x, y)
+                }
+                TopologyRoute::Cross { screen_id, x, y } => {
+                    self.enter_screen(previous, screen_id, x, y)
+                }
+            };
+        }
+        let HostRouter::Legacy(router) = router else {
+            unreachable!()
+        };
+        let route = router.route_motion(motion.dx, motion.dy);
+        match route {
             Route::Local { dx, dy } => vec![SessionEffect::InjectLocalMotion { dx, dy }],
             Route::Remote { dx, dy } => {
                 vec![SessionEffect::SendRemoteMotion(Motion { dx, dy, ..motion })]
@@ -205,6 +354,79 @@ impl DesktopSession {
                 effects
             }
         }
+    }
+
+    fn active_topology_screen(&self) -> Option<ScreenId> {
+        match self.router.as_ref()? {
+            HostRouter::Topology {
+                router,
+                local_screen,
+            } if router.active_screen() != local_screen => Some(router.active_screen().clone()),
+            _ => None,
+        }
+    }
+
+    fn enter_screen(
+        &mut self,
+        previous: ScreenId,
+        screen_id: ScreenId,
+        x: i32,
+        y: i32,
+    ) -> Vec<SessionEffect> {
+        let was_remote = self.control == ControlTarget::Remote;
+        self.control = ControlTarget::Remote;
+        let mut effects = Vec::new();
+        if was_remote {
+            self.remote_injected.clear();
+            effects.push(SessionEffect::ReleaseScreen {
+                screen_id: previous,
+            });
+        } else {
+            for held in std::mem::take(&mut self.local_injected) {
+                effects.push(SessionEffect::InjectLocal(
+                    held.event(ButtonState::Released),
+                ));
+            }
+        }
+        effects.push(SessionEffect::EnterScreen {
+            screen_id: screen_id.clone(),
+            x,
+            y,
+        });
+        for held in self.physical_held.iter().copied() {
+            let event = held.event(ButtonState::Pressed);
+            self.remote_injected.insert(held);
+            effects.push(SessionEffect::SendScreen {
+                screen_id: screen_id.clone(),
+                event,
+            });
+        }
+        if !was_remote {
+            effects.push(SessionEffect::ControlChanged(ControlTarget::Remote));
+        }
+        effects
+    }
+
+    fn enter_local_from_screen(
+        &mut self,
+        previous: ScreenId,
+        x: i32,
+        y: i32,
+    ) -> Vec<SessionEffect> {
+        self.control = ControlTarget::Local;
+        self.remote_injected.clear();
+        let mut effects = vec![
+            SessionEffect::ReleaseScreen {
+                screen_id: previous,
+            },
+            SessionEffect::SetLocalCursor { x, y },
+        ];
+        for held in self.physical_held.iter().copied() {
+            self.local_injected.insert(held);
+            effects.push(SessionEffect::InjectLocal(held.event(ButtonState::Pressed)));
+        }
+        effects.push(SessionEffect::ControlChanged(ControlTarget::Local));
+        effects
     }
 
     fn observe_physical(&mut self, event: InputEvent) {
@@ -248,7 +470,11 @@ impl DesktopSession {
             .collect();
         if self.role == SessionRole::Host && !self.remote_injected.is_empty() {
             self.remote_injected.clear();
-            effects.push(SessionEffect::ReleaseRemote);
+            if let Some(screen_id) = self.active_topology_screen() {
+                effects.push(SessionEffect::ReleaseScreen { screen_id });
+            } else {
+                effects.push(SessionEffect::ReleaseRemote);
+            }
         }
         effects
     }
@@ -503,5 +729,117 @@ mod tests {
                 SessionEffect::ControlChanged(ControlTarget::Remote),
             ]
         );
+    }
+
+    #[test]
+    fn removing_the_active_remote_screen_returns_control_local() {
+        let initial_topology = topology(true);
+        let mut session =
+            DesktopSession::host_topology(&initial_topology, ScreenId("local".into()), 99, 50)
+                .unwrap();
+        session.handle(SessionEvent::PhysicalMotion(motion(1, 8, 0)));
+        assert_eq!(session.snapshot().control, ControlTarget::Remote);
+
+        let effects = session.replace_topology(&topology(false)).unwrap();
+        assert_eq!(
+            effects,
+            vec![
+                SessionEffect::ReleaseScreen {
+                    screen_id: ScreenId("remote".into()),
+                },
+                SessionEffect::SetLocalCursor { x: 50, y: 50 },
+                SessionEffect::ControlChanged(ControlTarget::Local),
+            ]
+        );
+        assert_eq!(session.snapshot().control, ControlTarget::Local);
+    }
+
+    #[test]
+    fn crossing_between_remote_screens_targets_each_connection_in_order() {
+        let mut topology = topology(true);
+        topology.screens.push(super::super::topology::ScreenNode {
+            screen_id: ScreenId("remote-2".into()),
+            device_id: super::super::topology::TopologyDeviceId("peer-2".into()),
+            device_name: "peer-2".into(),
+            name: "remote-2".into(),
+            logical_size: ScreenSize::new(100, 100).unwrap(),
+            size_override: None,
+            online: true,
+            this_device: false,
+        });
+        topology.links.push(super::super::topology::ScreenLink {
+            from: super::super::topology::ScreenEdge {
+                screen_id: ScreenId("remote".into()),
+                edge: super::super::topology::Edge::Right,
+            },
+            to: super::super::topology::ScreenEdge {
+                screen_id: ScreenId("remote-2".into()),
+                edge: super::super::topology::Edge::Left,
+            },
+        });
+        let mut session =
+            DesktopSession::host_topology(&topology, ScreenId("local".into()), 99, 50).unwrap();
+        session.handle(SessionEvent::PhysicalMotion(motion(1, 8, 0)));
+        assert_eq!(
+            session.handle(SessionEvent::PhysicalMotion(motion(2, 100, 0))),
+            vec![SessionEffect::SendScreenMotion {
+                screen_id: ScreenId("remote".into()),
+                motion: motion(2, 100, 0),
+            }]
+        );
+        assert_eq!(
+            session.handle(SessionEvent::PhysicalMotion(motion(3, 8, 0))),
+            vec![
+                SessionEffect::ReleaseScreen {
+                    screen_id: ScreenId("remote".into()),
+                },
+                SessionEffect::EnterScreen {
+                    screen_id: ScreenId("remote-2".into()),
+                    x: 1,
+                    y: 50,
+                },
+            ]
+        );
+    }
+
+    fn topology(linked: bool) -> ScreenTopology {
+        let mut topology = ScreenTopology {
+            screens: vec![
+                super::super::topology::ScreenNode {
+                    screen_id: ScreenId("local".into()),
+                    device_id: super::super::topology::TopologyDeviceId("host".into()),
+                    device_name: "host".into(),
+                    name: "local".into(),
+                    logical_size: ScreenSize::new(100, 100).unwrap(),
+                    size_override: None,
+                    online: true,
+                    this_device: true,
+                },
+                super::super::topology::ScreenNode {
+                    screen_id: ScreenId("remote".into()),
+                    device_id: super::super::topology::TopologyDeviceId("peer".into()),
+                    device_name: "peer".into(),
+                    name: "remote".into(),
+                    logical_size: ScreenSize::new(100, 100).unwrap(),
+                    size_override: None,
+                    online: true,
+                    this_device: false,
+                },
+            ],
+            ..ScreenTopology::default()
+        };
+        if linked {
+            topology.links.push(super::super::topology::ScreenLink {
+                from: super::super::topology::ScreenEdge {
+                    screen_id: ScreenId("local".into()),
+                    edge: super::super::topology::Edge::Right,
+                },
+                to: super::super::topology::ScreenEdge {
+                    screen_id: ScreenId("remote".into()),
+                    edge: super::super::topology::Edge::Left,
+                },
+            });
+        }
+        topology
     }
 }

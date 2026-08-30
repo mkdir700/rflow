@@ -9,16 +9,14 @@ of building a queue. Keys, mouse buttons, and wheel events use a reliable ordere
 
 - Capture one or more Linux evdev devices.
 - Inject through Linux `/dev/uinput`, Windows `SendInput`, or macOS CoreGraphics.
-- Place one client in any of eight directions around the host and switch ownership at the matching
-  edge or corner.
+- Persist named screen-edge links and route across multiple devices and displays.
 - Map the entry coordinate between screens with different resolutions for cardinal layouts.
 - TLS 1.3 mutual device authentication with explicit first-connection confirmation.
 - Coalesce `REL_X` and `REL_Y` within an evdev batch and discard stale network datagrams.
 - Release held keys/buttons when the sender disconnects or requests shutdown.
 - IPv4 and IPv6 support, heartbeat, protocol version check, and structured logs.
 
-Not included yet: automatic discovery, GUI configuration, clipboard, arbitrary multi-screen
-graphs, or multiple simultaneous clients. The current layout is one host and one client.
+Not included yet: LAN service discovery, GUI configuration, clipboard, or cloud synchronization.
 
 ## Build
 
@@ -50,23 +48,17 @@ Windows: %APPDATA%\rflow\identity-cert.der
 Never copy `identity-key.der` away from its device. `rflow keygen` and the identity override options
 remain available for advanced pre-provisioning.
 
-Start the host with the client's direction relative to it. rflow detects the host's active screens,
-logical dimensions, keyboard, and pointer automatically.
-Valid directions are `top`, `top-right`, `right`, `bottom-right`, `bottom`, `bottom-left`, `left`,
-and `top-left`:
+Start the host. rflow detects the host's active screens, logical dimensions, keyboard, and pointer
+automatically:
 
 ```bash
 RUST_LOG=rflow=info rflow host \
-  --bind 0.0.0.0:24801 \
-  --direction right
+  --bind 0.0.0.0:24801
 ```
 
 On Linux, unreadable evdev devices produce a diagnostic listing the affected paths and permission
-remedy. `--device PATH` and `--size WIDTHxHEIGHT` remain temporary advanced overrides while the
-named-screen topology interface is introduced.
-
-Cardinal layouts cross a shared edge. Diagonal layouts touch at one corner, so the pointer must
-move outward across both axes together to cross; it returns through the opposite corner.
+remedy. `--device PATH` remains an advanced capture override. Use `rflow layout set-size` for a
+persistent logical-size override.
 
 On the client screen, connect to the host:
 
@@ -83,6 +75,34 @@ switched back to the Linux host before its input devices become available.
 On the first connection, both terminals display the same six-digit pairing code. Compare the codes,
 then enter `y` on the host to trust the client. rflow does not grab the host input devices until this
 confirmation succeeds. Both devices remember the trust relationship for later connections.
+
+Once the peer is connected, inspect the authenticated screen inventory and place its screen. A
+single-screen device name can be used as shorthand; multi-screen devices require an exact screen
+ID:
+
+```bash
+rflow layout screens
+rflow layout place macmini --right-of linux-desktop
+rflow layout
+```
+
+The four relative placement options are `--left-of`, `--right-of`, `--above`, and `--below`.
+Configuration is persisted in the platform application directory and applied to the running
+session immediately. Later `rflow host` invocations reuse it without a direction argument.
+
+Advanced and scripted layout management uses exact edges:
+
+```bash
+rflow layout link linux/DP-1.right macmini/main.left
+rflow layout unlink linux/DP-1.right
+rflow layout unplace macmini/main
+rflow layout set-size macmini/main 2560x1440
+rflow layout export > layout.json
+rflow layout apply layout.json --expected-revision 12
+```
+
+`--direction` remains only as a one-time migration aid for an unconfigured, single-remote-screen
+cardinal layout. It is rejected once a persistent link exists.
 
 List the remembered devices or explicitly remove one with:
 
@@ -133,7 +153,8 @@ rflow separates business decisions from execution and presentation:
   heartbeat, task supervision, shutdown, application commands/events, and the authoritative
   `RuntimeSnapshot` intended for CLI and future GPUI callers.
 - `platform` translates canonical domain input to native Linux/macOS/Windows capture and injection.
-- `protocol` explicitly translates domain input to protocol-v2 wire DTOs.
+- `protocol` explicitly translates domain input to protocol-v3 wire DTOs, including authenticated
+  multi-screen inventories.
 - diagnostics use a separate bounded, lossy worker and cannot block the input hot path.
 
 The CLI only parses arguments, submits `AppCommand`, and renders `AppEvent`. GPUI can use the same

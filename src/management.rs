@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    core::ScreenTopology,
+    core::{LayoutCommand, ScreenTopology},
     pairing::PairingRequestId,
     runtime::{AppCommand, ApplicationHandle},
 };
@@ -12,7 +12,7 @@ use crate::{
 #[cfg(unix)]
 use crate::identity::application_config_directory;
 
-const MANAGEMENT_PROTOCOL_VERSION: u16 = 2;
+const MANAGEMENT_PROTOCOL_VERSION: u16 = 3;
 const MAX_MANAGEMENT_FRAME: usize = 64 * 1024;
 #[cfg(unix)]
 pub const MANAGEMENT_SOCKET_FILE: &str = "management.sock";
@@ -25,8 +25,13 @@ pub enum ManagementRequest {
         expected_revision: u64,
         topology: ScreenTopology,
     },
+    ApplyLayout {
+        expected_revision: u64,
+        command: LayoutCommand,
+    },
     Accept(u64),
     Reject(u64),
+    ForgetPeer(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +50,7 @@ pub enum ManagementResponse {
     Pending(Option<PendingPairing>),
     Layout(ScreenTopology),
     TopologyQueued,
+    LayoutUpdated(ScreenTopology),
     DecisionQueued,
     Error(String),
 }
@@ -94,6 +100,13 @@ async fn dispatch(
                 Err(error) => ManagementResponse::Error(error.to_string()),
             }
         }
+        ManagementRequest::ApplyLayout {
+            expected_revision,
+            command,
+        } => match application.apply_layout(expected_revision, command).await {
+            Ok(topology) => ManagementResponse::LayoutUpdated(topology),
+            Err(error) => ManagementResponse::Error(error.to_string()),
+        },
         ManagementRequest::Pending => {
             ManagementResponse::Pending(pending.map(|request| PendingPairing {
                 request_id: request.request_id.to_string(),
@@ -125,6 +138,13 @@ async fn dispatch(
                 Err(error) => ManagementResponse::Error(error.to_string()),
             }
         }
+        ManagementRequest::ForgetPeer(value) => match value.parse() {
+            Ok(device_id) => match application.send(AppCommand::ForgetPeer(device_id)).await {
+                Ok(()) => ManagementResponse::DecisionQueued,
+                Err(error) => ManagementResponse::Error(error.to_string()),
+            },
+            Err(error) => ManagementResponse::Error(error.to_string()),
+        },
     }
 }
 
@@ -395,6 +415,42 @@ mod platform {
                 Some(AppCommand::AcceptPairing(id)) if id == request_id
             ));
 
+            server.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn layout_mutation_returns_the_committed_topology_not_a_queued_ack() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("management.sock");
+            let (application, mut commands) = application_test_channel(RuntimeSnapshot::default());
+            let server = ManagementServer::bind(&path, application).await.unwrap();
+            let responder = tokio::spawn(async move {
+                let Some(AppCommand::ApplyLayout { respond_to, .. }) = commands.recv().await else {
+                    panic!("expected layout command")
+                };
+                let _ = respond_to.send(Ok(ScreenTopology {
+                    revision: 1,
+                    ..ScreenTopology::default()
+                }));
+            });
+
+            let response = request(
+                &path,
+                ManagementRequest::ApplyLayout {
+                    expected_revision: 0,
+                    command: crate::core::LayoutCommand::Unplace {
+                        screen_id: crate::core::ScreenId("remote".into()),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                response,
+                ManagementResponse::LayoutUpdated(ScreenTopology { revision: 1, .. })
+            ));
+
+            responder.await.unwrap();
             server.shutdown().await.unwrap();
         }
     }
