@@ -11,7 +11,10 @@ use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tokio::sync::{mpsc, watch};
 
 use crate::{
-    core::{ControlTarget, DesktopSession, Motion, ScreenSize, SessionEffect, SessionEvent},
+    core::{
+        ControlTarget, DesktopSession, Motion, ScreenDirection, ScreenSize, SessionEffect,
+        SessionEvent,
+    },
     platform::{self, CapturedEvent, InputInjector},
     protocol::{
         MAX_RELIABLE_FRAME, MotionDto, PROTOCOL_VERSION, ReliableEvent, decode, decode_input,
@@ -27,7 +30,7 @@ pub struct HostConfig {
     pub key: PathBuf,
     pub size: ScreenSize,
     pub devices: Vec<PathBuf>,
-    pub right: bool,
+    pub direction: Option<ScreenDirection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,7 +405,8 @@ fn classify_fault(error: &anyhow::Error) -> AppFault {
     let lower = message.to_ascii_lowercase();
     let kind = if lower.contains("permission") || lower.contains("accessibility") {
         FaultKind::PermissionDenied
-    } else if lower.contains("pass --right")
+    } else if lower.contains("pass --direction")
+        || lower.contains("pass --right")
         || lower.contains("invalid")
         || lower.contains("configuration")
     {
@@ -429,9 +433,9 @@ async fn run_host(
     events: AppEventBus,
     _diagnostics: Arc<dyn DiagnosticSink>,
 ) -> Result<()> {
-    if !config.right {
-        bail!("the MVP supports one client on the right; pass --right");
-    }
+    let direction = config
+        .direction
+        .context("screen direction is required; pass --direction or legacy --right")?;
     platform::validate_capture(&config.devices)?;
     let endpoint = transport::server_endpoint(config.bind, &config.cert, &config.key)?;
     tracing::info!(local = %endpoint.local_addr()?, "host listening");
@@ -444,13 +448,22 @@ async fn run_host(
     events.send(AppEvent::PeerChanged(Some(remote))).await;
     publish_status(&events, RuntimeStatus::Connected).await;
     tracing::info!(%remote, "client connected");
-    run_host_connection(connection, config.size, config.devices, stop, events).await
+    run_host_connection(
+        connection,
+        config.size,
+        config.devices,
+        direction,
+        stop,
+        events,
+    )
+    .await
 }
 
 async fn run_host_connection(
     connection: Connection,
     local_size: ScreenSize,
     devices: Vec<PathBuf>,
+    direction: ScreenDirection,
     mut stop: watch::Receiver<bool>,
     events: AppEventBus,
 ) -> Result<()> {
@@ -481,7 +494,7 @@ async fn run_host_connection(
     )
     .await?;
 
-    let mut session = DesktopSession::host_right(local_size, remote_size);
+    let mut session = DesktopSession::host(local_size, remote_size, direction);
     events.try_send(AppEvent::ControlChanged(ControlTarget::Local));
     let mut injector = InputInjector::new()?;
     if let Some((x, y)) = platform::cursor_position() {
@@ -836,7 +849,7 @@ mod tests {
                 key: PathBuf::from("missing-key"),
                 size: ScreenSize::new(100, 100).unwrap(),
                 devices: Vec::new(),
-                right: false,
+                direction: None,
             }))
             .await
             .unwrap();
@@ -856,7 +869,7 @@ mod tests {
             panic!("expected classified fault")
         };
         assert_eq!(fault.kind, FaultKind::InvalidConfiguration);
-        assert!(fault.message.contains("pass --right"));
+        assert!(fault.message.contains("pass --direction"));
         assert_eq!(
             runtime.snapshot(),
             RuntimeSnapshot {
@@ -884,7 +897,7 @@ mod tests {
                 key,
                 size: ScreenSize::new(100, 100).unwrap(),
                 devices: vec![PathBuf::from("/dev/null")],
-                right: true,
+                direction: Some(ScreenDirection::Right),
             }))
             .await
             .unwrap();

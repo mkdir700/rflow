@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use super::topology::{CursorRouter, Route, ScreenSize};
+use super::topology::{CursorRouter, Route, ScreenDirection, ScreenSize};
 use super::{Button, ButtonState, InputEvent, Key, Motion};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,9 +73,13 @@ enum SessionRole {
 
 impl DesktopSession {
     pub fn host_right(local: ScreenSize, remote: ScreenSize) -> Self {
+        Self::host(local, remote, ScreenDirection::Right)
+    }
+
+    pub fn host(local: ScreenSize, remote: ScreenSize, direction: ScreenDirection) -> Self {
         Self {
             role: SessionRole::Host,
-            router: Some(CursorRouter::right(local, remote)),
+            router: Some(CursorRouter::new(local, remote, direction)),
             control: ControlTarget::Local,
             physical_held: BTreeSet::new(),
             local_injected: BTreeSet::new(),
@@ -426,5 +430,33 @@ mod tests {
             assert_eq!(left.handle(event), right.handle(event));
         }
         assert_eq!(left.snapshot(), right.snapshot());
+    }
+
+    #[test]
+    fn left_layout_keeps_session_transfer_effect_order() {
+        let mut session = DesktopSession::host(
+            ScreenSize::new(100, 100).unwrap(),
+            ScreenSize::new(200, 200).unwrap(),
+            crate::core::topology::ScreenDirection::Left,
+        );
+        session.set_local_position(1, 25);
+        let down = InputEvent::Key {
+            key: Key(30),
+            state: ButtonState::Pressed,
+        };
+        session.handle(SessionEvent::PhysicalInput(down));
+
+        assert_eq!(
+            session.handle(SessionEvent::PhysicalMotion(motion(1, -3, 0))),
+            vec![
+                SessionEffect::InjectLocal(InputEvent::Key {
+                    key: Key(30),
+                    state: ButtonState::Released,
+                }),
+                SessionEffect::EnterRemote { x: 198, y: 50 },
+                SessionEffect::SendRemote(down),
+                SessionEffect::ControlChanged(ControlTarget::Remote),
+            ]
+        );
     }
 }

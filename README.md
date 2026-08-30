@@ -9,15 +9,16 @@ of building a queue. Keys, mouse buttons, and wheel events use a reliable ordere
 
 - Capture one or more Linux evdev devices.
 - Inject through Linux `/dev/uinput`, Windows `SendInput`, or macOS CoreGraphics.
-- Place one client to the right of the host and switch ownership at the shared screen edge.
-- Map the entry height between screens with different resolutions.
+- Place one client in any of eight directions around the host and switch ownership at the matching
+  edge or corner.
+- Map the entry coordinate between screens with different resolutions for cardinal layouts.
 - TLS 1.3 authentication and encryption with an explicitly copied self-signed certificate.
 - Coalesce `REL_X` and `REL_Y` within an evdev batch and discard stale network datagrams.
 - Release held keys/buttons when the sender disconnects or requests shutdown.
 - IPv4 and IPv6 support, heartbeat, protocol version check, and structured logs.
 
-Not included yet: automatic discovery, GUI configuration, clipboard, arbitrary screen graphs, or
-multiple simultaneous clients. The current layout is one client to the host's right.
+Not included yet: automatic discovery, GUI configuration, clipboard, arbitrary multi-screen
+graphs, or multiple simultaneous clients. The current layout is one host and one client.
 
 ## Build
 
@@ -50,19 +51,25 @@ the host. Find stable keyboard and mouse paths:
 ls -l /dev/input/by-id/
 ```
 
-Start the host with its logical cursor-coordinate size and the single client on its right. With
-display scaling enabled, use the logical size (for example, 2560x1440 at 1.6x is 1600x900):
+Start the host with its logical cursor-coordinate size and the client's direction relative to it.
+Valid directions are `top`, `top-right`, `right`, `bottom-right`, `bottom`, `bottom-left`, `left`,
+and `top-left`. With display scaling enabled, use the logical size (for example, 2560x1440 at 1.6x
+is 1600x900):
 
 ```bash
 RUST_LOG=rflow=info rflow host \
   --bind 0.0.0.0:24801 \
   --size 1600x900 \
-  --right \
+  --direction right \
   --cert rflow-cert.der \
   --key rflow-key.der \
   --device /dev/input/by-id/your-keyboard-event-kbd \
   --device /dev/input/by-id/your-mouse-event-mouse
 ```
+
+`--right` remains available as a compatibility alias for `--direction right`. Cardinal layouts
+cross a shared edge. Diagonal layouts touch at one corner, so the pointer must move outward across
+both axes together to cross; it returns through the opposite corner.
 
 On the client screen, connect to the host:
 

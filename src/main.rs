@@ -3,7 +3,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use rflow::{
-    core::ScreenSize,
+    core::{ScreenDirection, ScreenSize},
     runtime::{
         AppCommand, AppEvent, ClientConfig, HostConfig, RuntimeHandle, RuntimeStatus,
         TracingDiagnostics,
@@ -44,8 +44,11 @@ enum Command {
         #[arg(long)]
         device: Vec<PathBuf>,
         /// Place the single client screen to the right of this host.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "direction")]
         right: bool,
+        /// Place the client in one of eight directions relative to the host.
+        #[arg(long, value_name = "DIRECTION", conflicts_with = "right")]
+        direction: Option<ScreenDirection>,
     },
     /// Join a host as a remotely controlled screen.
     Client {
@@ -78,35 +81,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_session(command: Command) -> Result<()> {
-    let app_command = match command {
-        Command::Host {
-            bind,
-            cert,
-            key,
-            size,
-            device,
-            right,
-        } => AppCommand::StartHost(HostConfig {
-            bind,
-            cert,
-            key,
-            size,
-            devices: device,
-            right,
-        }),
-        Command::Client {
-            target,
-            cert,
-            size,
-            retry_for,
-        } => AppCommand::StartClient(ClientConfig {
-            target,
-            cert,
-            size,
-            retry_for: Duration::from_secs(retry_for),
-        }),
-        Command::Keygen { .. } => unreachable!("keygen is handled before session startup"),
-    };
+    let app_command = command.into_app_command();
 
     let mut runtime = RuntimeHandle::spawn(Arc::new(TracingDiagnostics))?;
     runtime.send(app_command).await?;
@@ -144,6 +119,41 @@ async fn run_session(command: Command) -> Result<()> {
     Ok(())
 }
 
+impl Command {
+    fn into_app_command(self) -> AppCommand {
+        match self {
+            Command::Host {
+                bind,
+                cert,
+                key,
+                size,
+                device,
+                right,
+                direction,
+            } => AppCommand::StartHost(HostConfig {
+                bind,
+                cert,
+                key,
+                size,
+                devices: device,
+                direction: direction.or(right.then_some(ScreenDirection::Right)),
+            }),
+            Command::Client {
+                target,
+                cert,
+                size,
+                retry_for,
+            } => AppCommand::StartClient(ClientConfig {
+                target,
+                cert,
+                size,
+                retry_for: Duration::from_secs(retry_for),
+            }),
+            Command::Keygen { .. } => unreachable!("keygen is handled before session startup"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +183,81 @@ mod tests {
             }
             _ => panic!("expected host command"),
         }
+    }
+
+    #[test]
+    fn host_parses_all_direction_names() {
+        let names = [
+            "top",
+            "top-right",
+            "right",
+            "bottom-right",
+            "bottom",
+            "bottom-left",
+            "left",
+            "top-left",
+        ];
+        for name in names {
+            let cli = Cli::try_parse_from([
+                "rflow",
+                "host",
+                "--size",
+                "1920x1080",
+                "--direction",
+                name,
+                "--device",
+                "/dev/input/event1",
+            ])
+            .unwrap();
+            let Command::Host {
+                direction, right, ..
+            } = cli.command
+            else {
+                panic!("expected host command")
+            };
+            assert_eq!(direction.unwrap().to_string(), name);
+            assert!(!right);
+        }
+    }
+
+    #[test]
+    fn legacy_right_maps_to_right_direction() {
+        let cli = Cli::try_parse_from(["rflow", "host", "--size", "1920x1080", "--right"]).unwrap();
+        let AppCommand::StartHost(config) = cli.command.into_app_command() else {
+            panic!("expected host command")
+        };
+        assert_eq!(config.direction, Some(ScreenDirection::Right));
+    }
+
+    #[test]
+    fn host_rejects_conflicting_layout_options() {
+        assert!(
+            Cli::try_parse_from([
+                "rflow",
+                "host",
+                "--size",
+                "1920x1080",
+                "--right",
+                "--direction",
+                "left",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn host_rejects_unknown_direction() {
+        assert!(
+            Cli::try_parse_from([
+                "rflow",
+                "host",
+                "--size",
+                "1920x1080",
+                "--direction",
+                "upper-right",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

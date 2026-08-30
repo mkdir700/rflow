@@ -44,6 +44,64 @@ impl FromStr for ScreenSize {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenDirection {
+    Top,
+    TopRight,
+    Right,
+    BottomRight,
+    Bottom,
+    BottomLeft,
+    Left,
+    TopLeft,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenDirectionParseError(String);
+
+impl fmt::Display for ScreenDirectionParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ScreenDirectionParseError {}
+
+impl fmt::Display for ScreenDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Top => "top",
+            Self::TopRight => "top-right",
+            Self::Right => "right",
+            Self::BottomRight => "bottom-right",
+            Self::Bottom => "bottom",
+            Self::BottomLeft => "bottom-left",
+            Self::Left => "left",
+            Self::TopLeft => "top-left",
+        })
+    }
+}
+
+impl FromStr for ScreenDirection {
+    type Err = ScreenDirectionParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "top" => Ok(Self::Top),
+            "top-right" => Ok(Self::TopRight),
+            "right" => Ok(Self::Right),
+            "bottom-right" => Ok(Self::BottomRight),
+            "bottom" => Ok(Self::Bottom),
+            "bottom-left" => Ok(Self::BottomLeft),
+            "left" => Ok(Self::Left),
+            "top-left" => Ok(Self::TopLeft),
+            _ => Err(ScreenDirectionParseError(format!(
+                "invalid direction {value}; expected top, top-right, right, bottom-right, bottom, bottom-left, left, or top-left"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActiveScreen {
     Local,
     Remote,
@@ -60,16 +118,23 @@ pub(crate) enum Route {
 pub(crate) struct CursorRouter {
     local: ScreenSize,
     remote: ScreenSize,
+    direction: ScreenDirection,
     active: ActiveScreen,
     x: i32,
     y: i32,
 }
 
 impl CursorRouter {
-    pub(crate) fn right(local: ScreenSize, remote: ScreenSize) -> Self {
+    #[cfg(test)]
+    fn right(local: ScreenSize, remote: ScreenSize) -> Self {
+        Self::new(local, remote, ScreenDirection::Right)
+    }
+
+    pub(crate) fn new(local: ScreenSize, remote: ScreenSize, direction: ScreenDirection) -> Self {
         Self {
             local,
             remote,
+            direction,
             active: ActiveScreen::Local,
             x: local.width / 2,
             y: local.height / 2,
@@ -96,36 +161,206 @@ impl CursorRouter {
 
     fn route_local(&mut self, dx: i32, dy: i32) -> Route {
         let next_x = self.x.saturating_add(dx);
-        self.y = self.y.saturating_add(dy).clamp(0, self.local.height - 1);
-        if next_x >= self.local.width {
-            let overflow = next_x - (self.local.width - 1);
-            self.active = ActiveScreen::Remote;
-            self.x = overflow.clamp(0, self.remote.width - 1);
-            self.y = scale_axis(self.y, self.local.height, self.remote.height);
-            Route::EnterRemote {
-                x: self.x,
-                y: self.y,
+        let next_y = self.y.saturating_add(dy);
+        match self.direction {
+            ScreenDirection::Right if next_x >= self.local.width => {
+                let overflow = next_x - (self.local.width - 1);
+                self.active = ActiveScreen::Remote;
+                self.x = overflow.clamp(0, self.remote.width - 1);
+                self.y = scale_axis(
+                    next_y.clamp(0, self.local.height - 1),
+                    self.local.height,
+                    self.remote.height,
+                );
+                Route::EnterRemote {
+                    x: self.x,
+                    y: self.y,
+                }
             }
-        } else {
-            self.x = next_x.clamp(0, self.local.width - 1);
-            Route::Local { dx, dy }
+            ScreenDirection::Left if next_x < 0 => {
+                self.active = ActiveScreen::Remote;
+                self.x = self.remote.width.saturating_sub(2);
+                self.y = scale_axis(
+                    next_y.clamp(0, self.local.height - 1),
+                    self.local.height,
+                    self.remote.height,
+                );
+                Route::EnterRemote {
+                    x: self.x,
+                    y: self.y,
+                }
+            }
+            ScreenDirection::Top if next_y < 0 => {
+                self.active = ActiveScreen::Remote;
+                self.x = scale_axis(
+                    next_x.clamp(0, self.local.width - 1),
+                    self.local.width,
+                    self.remote.width,
+                );
+                self.y = self.remote.height.saturating_sub(2);
+                Route::EnterRemote {
+                    x: self.x,
+                    y: self.y,
+                }
+            }
+            ScreenDirection::TopRight if next_x >= self.local.width && next_y < 0 => {
+                self.active = ActiveScreen::Remote;
+                self.x = 1.min(self.remote.width - 1);
+                self.y = self.remote.height.saturating_sub(2);
+                Route::EnterRemote {
+                    x: self.x,
+                    y: self.y,
+                }
+            }
+            ScreenDirection::Bottom if next_y >= self.local.height => {
+                self.active = ActiveScreen::Remote;
+                self.x = scale_axis(
+                    next_x.clamp(0, self.local.width - 1),
+                    self.local.width,
+                    self.remote.width,
+                );
+                self.y = 1.min(self.remote.height - 1);
+                Route::EnterRemote {
+                    x: self.x,
+                    y: self.y,
+                }
+            }
+            ScreenDirection::BottomRight
+                if next_x >= self.local.width && next_y >= self.local.height =>
+            {
+                self.active = ActiveScreen::Remote;
+                self.x = 1.min(self.remote.width - 1);
+                self.y = 1.min(self.remote.height - 1);
+                Route::EnterRemote {
+                    x: self.x,
+                    y: self.y,
+                }
+            }
+            ScreenDirection::BottomLeft if next_x < 0 && next_y >= self.local.height => {
+                self.active = ActiveScreen::Remote;
+                self.x = self.remote.width.saturating_sub(2);
+                self.y = 1.min(self.remote.height - 1);
+                Route::EnterRemote {
+                    x: self.x,
+                    y: self.y,
+                }
+            }
+            ScreenDirection::TopLeft if next_x < 0 && next_y < 0 => {
+                self.active = ActiveScreen::Remote;
+                self.x = self.remote.width.saturating_sub(2);
+                self.y = self.remote.height.saturating_sub(2);
+                Route::EnterRemote {
+                    x: self.x,
+                    y: self.y,
+                }
+            }
+            _ => {
+                self.x = next_x.clamp(0, self.local.width - 1);
+                self.y = next_y.clamp(0, self.local.height - 1);
+                Route::Local { dx, dy }
+            }
         }
     }
 
     fn route_remote(&mut self, dx: i32, dy: i32) -> Route {
         let next_x = self.x.saturating_add(dx);
-        self.y = self.y.saturating_add(dy).clamp(0, self.remote.height - 1);
-        if next_x < 0 {
-            self.active = ActiveScreen::Local;
-            self.x = self.local.width.saturating_sub(2);
-            self.y = scale_axis(self.y, self.remote.height, self.local.height);
-            Route::EnterLocal {
-                x: self.x,
-                y: self.y,
+        let next_y = self.y.saturating_add(dy);
+        match self.direction {
+            ScreenDirection::Right if next_x < 0 => {
+                self.active = ActiveScreen::Local;
+                self.x = self.local.width.saturating_sub(2);
+                self.y = scale_axis(
+                    next_y.clamp(0, self.remote.height - 1),
+                    self.remote.height,
+                    self.local.height,
+                );
+                Route::EnterLocal {
+                    x: self.x,
+                    y: self.y,
+                }
             }
-        } else {
-            self.x = next_x.clamp(0, self.remote.width - 1);
-            Route::Remote { dx, dy }
+            ScreenDirection::Left if next_x >= self.remote.width => {
+                self.active = ActiveScreen::Local;
+                self.x = 1.min(self.local.width - 1);
+                self.y = scale_axis(
+                    next_y.clamp(0, self.remote.height - 1),
+                    self.remote.height,
+                    self.local.height,
+                );
+                Route::EnterLocal {
+                    x: self.x,
+                    y: self.y,
+                }
+            }
+            ScreenDirection::Top if next_y >= self.remote.height => {
+                self.active = ActiveScreen::Local;
+                self.x = scale_axis(
+                    next_x.clamp(0, self.remote.width - 1),
+                    self.remote.width,
+                    self.local.width,
+                );
+                self.y = 1.min(self.local.height - 1);
+                Route::EnterLocal {
+                    x: self.x,
+                    y: self.y,
+                }
+            }
+            ScreenDirection::TopRight if next_x < 0 && next_y >= self.remote.height => {
+                self.active = ActiveScreen::Local;
+                self.x = self.local.width.saturating_sub(2);
+                self.y = 1.min(self.local.height - 1);
+                Route::EnterLocal {
+                    x: self.x,
+                    y: self.y,
+                }
+            }
+            ScreenDirection::Bottom if next_y < 0 => {
+                self.active = ActiveScreen::Local;
+                self.x = scale_axis(
+                    next_x.clamp(0, self.remote.width - 1),
+                    self.remote.width,
+                    self.local.width,
+                );
+                self.y = self.local.height.saturating_sub(2);
+                Route::EnterLocal {
+                    x: self.x,
+                    y: self.y,
+                }
+            }
+            ScreenDirection::BottomRight if next_x < 0 && next_y < 0 => {
+                self.active = ActiveScreen::Local;
+                self.x = self.local.width.saturating_sub(2);
+                self.y = self.local.height.saturating_sub(2);
+                Route::EnterLocal {
+                    x: self.x,
+                    y: self.y,
+                }
+            }
+            ScreenDirection::BottomLeft if next_x >= self.remote.width && next_y < 0 => {
+                self.active = ActiveScreen::Local;
+                self.x = 1.min(self.local.width - 1);
+                self.y = self.local.height.saturating_sub(2);
+                Route::EnterLocal {
+                    x: self.x,
+                    y: self.y,
+                }
+            }
+            ScreenDirection::TopLeft
+                if next_x >= self.remote.width && next_y >= self.remote.height =>
+            {
+                self.active = ActiveScreen::Local;
+                self.x = 1.min(self.local.width - 1);
+                self.y = 1.min(self.local.height - 1);
+                Route::EnterLocal {
+                    x: self.x,
+                    y: self.y,
+                }
+            }
+            _ => {
+                self.x = next_x.clamp(0, self.remote.width - 1);
+                self.y = next_y.clamp(0, self.remote.height - 1);
+                Route::Remote { dx, dy }
+            }
         }
     }
 }
@@ -155,6 +390,106 @@ mod tests {
             Route::EnterRemote { x: 4, y: 720 }
         );
         assert_eq!(router.active(), ActiveScreen::Remote);
+    }
+
+    #[test]
+    fn left_layout_crosses_host_left_edge_and_returns_at_remote_right_edge() {
+        let mut router = CursorRouter::new(
+            ScreenSize::new(100, 100).unwrap(),
+            ScreenSize::new(200, 200).unwrap(),
+            ScreenDirection::Left,
+        );
+        router.set_local_position(1, 25);
+
+        assert_eq!(
+            router.route_motion(-3, 0),
+            Route::EnterRemote { x: 198, y: 50 }
+        );
+        assert_eq!(router.route_motion(3, 0), Route::EnterLocal { x: 1, y: 25 });
+    }
+
+    #[test]
+    fn top_layout_crosses_host_top_edge_and_returns_at_remote_bottom_edge() {
+        let mut router = CursorRouter::new(
+            ScreenSize::new(100, 100).unwrap(),
+            ScreenSize::new(200, 200).unwrap(),
+            ScreenDirection::Top,
+        );
+        router.set_local_position(25, 1);
+
+        assert_eq!(
+            router.route_motion(0, -3),
+            Route::EnterRemote { x: 50, y: 198 }
+        );
+        assert_eq!(router.route_motion(0, 3), Route::EnterLocal { x: 25, y: 1 });
+    }
+
+    #[test]
+    fn top_right_layout_requires_corner_crossing_in_both_directions() {
+        let mut router = CursorRouter::new(
+            ScreenSize::new(100, 100).unwrap(),
+            ScreenSize::new(200, 200).unwrap(),
+            ScreenDirection::TopRight,
+        );
+        router.set_local_position(98, 1);
+
+        assert_eq!(router.route_motion(3, 0), Route::Local { dx: 3, dy: 0 });
+        assert_eq!(
+            router.route_motion(3, -3),
+            Route::EnterRemote { x: 1, y: 198 }
+        );
+        assert_eq!(
+            router.route_motion(-3, 3),
+            Route::EnterLocal { x: 98, y: 1 }
+        );
+    }
+
+    #[test]
+    fn bottom_and_remaining_corner_layouts_cross_at_their_matching_edges() {
+        let cases = [
+            (
+                ScreenDirection::Bottom,
+                (25, 98),
+                (0, 3),
+                Route::EnterRemote { x: 50, y: 1 },
+                (0, -3),
+                Route::EnterLocal { x: 25, y: 98 },
+            ),
+            (
+                ScreenDirection::BottomRight,
+                (98, 98),
+                (3, 3),
+                Route::EnterRemote { x: 1, y: 1 },
+                (-3, -3),
+                Route::EnterLocal { x: 98, y: 98 },
+            ),
+            (
+                ScreenDirection::BottomLeft,
+                (1, 98),
+                (-3, 3),
+                Route::EnterRemote { x: 198, y: 1 },
+                (3, -3),
+                Route::EnterLocal { x: 1, y: 98 },
+            ),
+            (
+                ScreenDirection::TopLeft,
+                (1, 1),
+                (-3, -3),
+                Route::EnterRemote { x: 198, y: 198 },
+                (3, 3),
+                Route::EnterLocal { x: 1, y: 1 },
+            ),
+        ];
+        for (direction, start, outbound, entered, inbound, returned) in cases {
+            let mut router = CursorRouter::new(
+                ScreenSize::new(100, 100).unwrap(),
+                ScreenSize::new(200, 200).unwrap(),
+                direction,
+            );
+            router.set_local_position(start.0, start.1);
+            assert_eq!(router.route_motion(outbound.0, outbound.1), entered);
+            assert_eq!(router.route_motion(inbound.0, inbound.1), returned);
+        }
     }
 
     #[test]
