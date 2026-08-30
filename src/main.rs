@@ -150,7 +150,7 @@ async fn host_connection(
 
     let (reliable_tx, mut reliable_rx) = mpsc::channel(256);
     let (motion_tx, mut motion_rx) = watch::channel(None);
-    let _capture_threads = spawn_capture(devices, true, reliable_tx, motion_tx);
+    let _capture_threads = spawn_capture(devices, true, reliable_tx, motion_tx)?;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     let mut heartbeat_sequence = 0_u64;
     let mut physical_pressed = PressedState::default();

@@ -174,12 +174,12 @@ pub fn spawn_capture(
     grab: bool,
     reliable: mpsc::Sender<ReliableEvent>,
     motion: watch::Sender<Option<Motion>>,
-) -> Vec<std::thread::JoinHandle<()>> {
-    vec![std::thread::spawn(move || {
+) -> Result<Vec<std::thread::JoinHandle<()>>> {
+    Ok(vec![std::thread::spawn(move || {
         if let Err(error) = capture_events(grab, reliable, motion) {
             tracing::error!(%error, "macOS input capture stopped");
         }
-    })]
+    })])
 }
 
 fn capture_events(

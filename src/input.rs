@@ -1,6 +1,7 @@
 use std::{
     path::PathBuf,
     process::Command,
+    sync::mpsc as std_mpsc,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -48,21 +49,35 @@ pub fn spawn_capture(
     grab: bool,
     reliable: mpsc::Sender<ReliableEvent>,
     motion: watch::Sender<Option<Motion>>,
-) -> Vec<std::thread::JoinHandle<()>> {
+) -> Result<Vec<std::thread::JoinHandle<()>>> {
     let sequence = Arc::new(AtomicU64::new(0));
-    paths
+    let expected = paths.len();
+    let (ready_tx, ready_rx) = std_mpsc::channel();
+    let handles = paths
         .into_iter()
         .map(|path| {
             let reliable = reliable.clone();
             let motion = motion.clone();
             let sequence = sequence.clone();
+            let ready = ready_tx.clone();
             std::thread::spawn(move || {
-                if let Err(error) = capture_device(&path, grab, reliable, motion, sequence) {
+                if let Err(error) = capture_device(&path, grab, reliable, motion, sequence, &ready)
+                {
+                    let _ = ready.send(Err(format!("{error:#}")));
                     tracing::error!(device = %path.display(), %error, "input capture stopped");
                 }
             })
         })
-        .collect()
+        .collect();
+    drop(ready_tx);
+    for _ in 0..expected {
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => anyhow::bail!("input capture failed before startup: {error}"),
+            Err(_) => anyhow::bail!("input capture stopped before startup completed"),
+        }
+    }
+    Ok(handles)
 }
 
 fn capture_device(
@@ -71,6 +86,7 @@ fn capture_device(
     reliable: mpsc::Sender<ReliableEvent>,
     motion: watch::Sender<Option<Motion>>,
     sequence: Arc<AtomicU64>,
+    ready: &std_mpsc::Sender<std::result::Result<(), String>>,
 ) -> Result<()> {
     let mut device =
         Device::open(path).with_context(|| format!("open input device {}", path.display()))?;
@@ -80,6 +96,7 @@ fn capture_device(
             .with_context(|| format!("grab {}", path.display()))?;
     }
     tracing::info!(device = %path.display(), name = ?device.name(), grab, "capturing input");
+    let _ = ready.send(Ok(()));
 
     loop {
         let events: Vec<_> = device.fetch_events()?.collect();

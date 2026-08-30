@@ -38,9 +38,9 @@ pub fn spawn_capture(
     _grab: bool,
     _reliable: mpsc::Sender<ReliableEvent>,
     _motion: watch::Sender<Option<Motion>>,
-) -> Vec<std::thread::JoinHandle<()>> {
+) -> Result<Vec<std::thread::JoinHandle<()>>> {
     tracing::error!("Windows input capture is not implemented; use Windows as `rflow host`");
-    Vec::new()
+    Ok(Vec::new())
 }
 
 pub struct Injector;
