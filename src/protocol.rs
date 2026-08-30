@@ -1,16 +1,21 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::core::{Button, ButtonState, InputEvent, Key, Motion as DomainMotion};
+
 pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_RELIABLE_FRAME: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Motion {
+pub struct MotionDto {
     pub sequence: u64,
     pub timestamp_micros: u64,
     pub dx: i32,
     pub dy: i32,
 }
+
+/// Compatibility alias for protocol-v2 callers during the architecture migration.
+pub type Motion = MotionDto;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReliableEvent {
@@ -38,6 +43,148 @@ pub enum ReliableEvent {
     ReleaseAll,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputConversionError {
+    NotInput,
+    UnsupportedEventType(u16),
+    UnsupportedRelativeAxis(u16),
+    CombinedScroll,
+}
+
+impl std::fmt::Display for InputConversionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotInput => f.write_str("wire event is not an input event"),
+            Self::UnsupportedEventType(value) => write!(f, "unsupported event type {value}"),
+            Self::UnsupportedRelativeAxis(value) => {
+                write!(f, "unsupported relative axis {value}")
+            }
+            Self::CombinedScroll => {
+                f.write_str("protocol v2 requires horizontal and vertical scroll to be split")
+            }
+        }
+    }
+}
+
+impl std::error::Error for InputConversionError {}
+
+pub fn encode_input(
+    sequence: u64,
+    event: InputEvent,
+) -> Result<ReliableEvent, InputConversionError> {
+    let (event_type, code, value) = match event {
+        InputEvent::Key { key, state } => (1, key.0, encode_state(state)),
+        InputEvent::Button { button, state } => (1, encode_button(button), encode_state(state)),
+        InputEvent::Scroll {
+            horizontal: 0,
+            vertical,
+        } => (2, 8, vertical),
+        InputEvent::Scroll {
+            horizontal,
+            vertical: 0,
+        } => (2, 6, horizontal),
+        InputEvent::Scroll { .. } => return Err(InputConversionError::CombinedScroll),
+    };
+    Ok(ReliableEvent::Input {
+        sequence,
+        event_type,
+        code,
+        value,
+    })
+}
+
+pub fn decode_input(event: &ReliableEvent) -> Result<InputEvent, InputConversionError> {
+    let ReliableEvent::Input {
+        event_type,
+        code,
+        value,
+        ..
+    } = *event
+    else {
+        return Err(InputConversionError::NotInput);
+    };
+    match event_type {
+        1 if (272..=287).contains(&code) => Ok(InputEvent::Button {
+            button: decode_button(code),
+            state: decode_state(value),
+        }),
+        1 => Ok(InputEvent::Key {
+            key: Key(code),
+            state: decode_state(value),
+        }),
+        2 if code == 6 => Ok(InputEvent::Scroll {
+            horizontal: value,
+            vertical: 0,
+        }),
+        2 if code == 8 => Ok(InputEvent::Scroll {
+            horizontal: 0,
+            vertical: value,
+        }),
+        2 => Err(InputConversionError::UnsupportedRelativeAxis(code)),
+        value => Err(InputConversionError::UnsupportedEventType(value)),
+    }
+}
+
+impl From<DomainMotion> for MotionDto {
+    fn from(value: DomainMotion) -> Self {
+        Self {
+            sequence: value.sequence,
+            timestamp_micros: value.timestamp_micros,
+            dx: value.dx,
+            dy: value.dy,
+        }
+    }
+}
+
+impl From<MotionDto> for DomainMotion {
+    fn from(value: MotionDto) -> Self {
+        Self {
+            sequence: value.sequence,
+            timestamp_micros: value.timestamp_micros,
+            dx: value.dx,
+            dy: value.dy,
+        }
+    }
+}
+
+fn encode_state(state: ButtonState) -> i32 {
+    match state {
+        ButtonState::Pressed => 1,
+        ButtonState::Released => 0,
+        ButtonState::Repeated => 2,
+    }
+}
+
+fn decode_state(value: i32) -> ButtonState {
+    match value {
+        0 => ButtonState::Released,
+        2 => ButtonState::Repeated,
+        _ => ButtonState::Pressed,
+    }
+}
+
+fn encode_button(button: Button) -> u16 {
+    match button {
+        Button::Left => 272,
+        Button::Right => 273,
+        Button::Middle => 274,
+        Button::Back => 275,
+        Button::Forward => 276,
+        Button::Other(code) => code,
+    }
+}
+
+fn decode_button(code: u16) -> Button {
+    match code {
+        272 => Button::Left,
+        273 => Button::Right,
+        274 => Button::Middle,
+        275 => Button::Back,
+        276 => Button::Forward,
+        code => Button::Other(code),
+    }
+}
+
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     postcard::to_allocvec(value).context("encode protocol message")
 }
@@ -63,15 +210,41 @@ mod tests {
 
     #[test]
     fn motion_round_trip() {
-        let event = Motion {
+        let event = MotionDto {
             sequence: 42,
             timestamp_micros: 123_456,
             dx: -7,
             dy: 9,
         };
         let bytes = encode(&event).unwrap();
-        assert_eq!(decode::<Motion>(&bytes).unwrap(), event);
+        assert_eq!(decode::<MotionDto>(&bytes).unwrap(), event);
         assert!(bytes.len() < 32);
+    }
+
+    #[test]
+    fn domain_input_has_explicit_wire_conversion() {
+        let inputs = [
+            InputEvent::Key {
+                key: Key(30),
+                state: ButtonState::Pressed,
+            },
+            InputEvent::Button {
+                button: Button::Left,
+                state: ButtonState::Released,
+            },
+            InputEvent::Scroll {
+                horizontal: 0,
+                vertical: -1,
+            },
+            InputEvent::Key {
+                key: Key(30),
+                state: ButtonState::Repeated,
+            },
+        ];
+        for (sequence, input) in inputs.into_iter().enumerate() {
+            let wire = encode_input(sequence as u64, input).unwrap();
+            assert_eq!(decode_input(&wire).unwrap(), input);
+        }
     }
 
     #[test]

@@ -1,7 +1,9 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use anyhow::Result;
-use tokio::sync::{mpsc, watch};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP, MOUSEEVENTF_HWHEEL,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
@@ -9,10 +11,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput,
 };
 
-use crate::{
-    protocol::{Motion, ReliableEvent},
-    router::ScreenSize,
-};
+use crate::core::ScreenSize;
 
 pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
@@ -20,6 +19,24 @@ pub const REL_X: u16 = 0x00;
 pub const REL_Y: u16 = 0x01;
 const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NativeCapturedEvent {
+    Input {
+        sequence: u64,
+        event_type: u16,
+        code: u16,
+        value: i32,
+    },
+    Motion {
+        sequence: u64,
+        timestamp_micros: u64,
+        dx: i32,
+        dy: i32,
+    },
+}
+
+pub(crate) type CaptureCallback = Arc<dyn Fn(NativeCapturedEvent) + Send + Sync>;
 
 pub fn validate_capture(_paths: &[PathBuf]) -> Result<()> {
     anyhow::bail!("Windows input capture is not implemented; use Windows as `rflow client`")
@@ -36,8 +53,8 @@ pub fn cursor_position() -> Option<(i32, i32)> {
 pub fn spawn_capture(
     _paths: Vec<PathBuf>,
     _grab: bool,
-    _reliable: mpsc::Sender<ReliableEvent>,
-    _motion: watch::Sender<Option<Motion>>,
+    _callback: CaptureCallback,
+    _stop: Arc<AtomicBool>,
 ) -> Result<Vec<std::thread::JoinHandle<()>>> {
     tracing::error!("Windows input capture is not implemented; use Windows as `rflow host`");
     Ok(Vec::new())

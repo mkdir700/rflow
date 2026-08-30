@@ -84,13 +84,31 @@ Crossing a screen boundary releases held keys and mouse buttons on the old scree
 on the new screen. This prevents modifiers such as Super/Command from remaining stuck while still
 allowing a modifier to be held across the boundary.
 
+## Architecture
+
+rflow separates business decisions from execution and presentation:
+
+- `core` is a pure, deterministic input-routing state machine. `DesktopSession::handle` turns
+  domain events into ordered effects and owns physical/local/remote pressed-state invariants.
+- `runtime` is the single writer for an active session. It owns Tokio/Quinn, reconnects,
+  heartbeat, task supervision, shutdown, application commands/events, and the authoritative
+  `RuntimeSnapshot` intended for CLI and future GPUI callers.
+- `platform` translates canonical domain input to native Linux/macOS/Windows capture and injection.
+- `protocol` explicitly translates domain input to protocol-v2 wire DTOs.
+- diagnostics use a separate bounded, lossy worker and cannot block the input hot path.
+
+The CLI only parses arguments, submits `AppCommand`, and renders `AppEvent`. GPUI can use the same
+`RuntimeHandle` without moving Quinn or input capture onto the UI thread. See
+[`docs/specs/001.md`](docs/specs/001.md) for the full architecture contract.
+
 ## Latency design
 
 - Mouse movement is never placed in the reliable input queue.
 - A Tokio watch channel stores only the newest pending movement.
 - QUIC datagrams are sequence-numbered; late or duplicate movement is ignored.
 - A bounded reliable queue applies backpressure to key and button events rather than losing them.
-- Input capture uses blocking OS threads, separate from the async network runtime.
+- Input capture uses owned OS threads, separate from the async network runtime, with explicit stop
+  and device-release semantics.
 
 Run tests and static checks with:
 

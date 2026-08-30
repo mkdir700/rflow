@@ -4,28 +4,43 @@ use std::{
     sync::mpsc as std_mpsc,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::SystemTime,
 };
 
+use crate::core::ScreenSize;
 use anyhow::{Context, Result};
 use evdev::{
     AttributeSet, Device, EventType, InputEvent, KeyCode, RelativeAxisCode, uinput::VirtualDevice,
 };
-use tokio::sync::{mpsc, watch};
-
-use crate::protocol::{Motion, ReliableEvent};
-use crate::router::ScreenSize;
 
 pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
 pub const REL_X: u16 = 0x00;
 pub const REL_Y: u16 = 0x01;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NativeCapturedEvent {
+    Input {
+        sequence: u64,
+        event_type: u16,
+        code: u16,
+        value: i32,
+    },
+    Motion {
+        sequence: u64,
+        timestamp_micros: u64,
+        dx: i32,
+        dy: i32,
+    },
+}
+
+pub(crate) type CaptureCallback = Arc<dyn Fn(NativeCapturedEvent) + Send + Sync>;
+
 pub fn validate_capture(paths: &[PathBuf]) -> Result<()> {
     if paths.is_empty() {
-        anyhow::bail!("Linux connect requires at least one --device path");
+        anyhow::bail!("Linux host requires at least one --device path");
     }
     Ok(())
 }
@@ -47,22 +62,21 @@ pub fn cursor_position() -> Option<(i32, i32)> {
 pub fn spawn_capture(
     paths: Vec<PathBuf>,
     grab: bool,
-    reliable: mpsc::Sender<ReliableEvent>,
-    motion: watch::Sender<Option<Motion>>,
+    callback: CaptureCallback,
+    stop: Arc<AtomicBool>,
 ) -> Result<Vec<std::thread::JoinHandle<()>>> {
     let sequence = Arc::new(AtomicU64::new(0));
     let expected = paths.len();
     let (ready_tx, ready_rx) = std_mpsc::channel();
-    let handles = paths
+    let handles: Vec<std::thread::JoinHandle<()>> = paths
         .into_iter()
         .map(|path| {
-            let reliable = reliable.clone();
-            let motion = motion.clone();
+            let callback = callback.clone();
             let sequence = sequence.clone();
             let ready = ready_tx.clone();
+            let stop = stop.clone();
             std::thread::spawn(move || {
-                if let Err(error) = capture_device(&path, grab, reliable, motion, sequence, &ready)
-                {
+                if let Err(error) = capture_device(&path, grab, callback, sequence, &ready, &stop) {
                     let _ = ready.send(Err(format!("{error:#}")));
                     tracing::error!(device = %path.display(), %error, "input capture stopped");
                 }
@@ -70,12 +84,26 @@ pub fn spawn_capture(
         })
         .collect();
     drop(ready_tx);
+    let mut startup_error = None;
     for _ in 0..expected {
         match ready_rx.recv() {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => anyhow::bail!("input capture failed before startup: {error}"),
-            Err(_) => anyhow::bail!("input capture stopped before startup completed"),
+            Ok(Err(error)) => {
+                startup_error = Some(format!("input capture failed before startup: {error}"));
+                break;
+            }
+            Err(_) => {
+                startup_error = Some("input capture stopped before startup completed".to_owned());
+                break;
+            }
         }
+    }
+    if let Some(error) = startup_error {
+        stop.store(true, Ordering::Release);
+        for handle in handles {
+            let _ = handle.join();
+        }
+        anyhow::bail!(error);
     }
     Ok(handles)
 }
@@ -83,10 +111,10 @@ pub fn spawn_capture(
 fn capture_device(
     path: &PathBuf,
     grab: bool,
-    reliable: mpsc::Sender<ReliableEvent>,
-    motion: watch::Sender<Option<Motion>>,
+    callback: CaptureCallback,
     sequence: Arc<AtomicU64>,
     ready: &std_mpsc::Sender<std::result::Result<(), String>>,
+    stop: &AtomicBool,
 ) -> Result<()> {
     let mut device =
         Device::open(path).with_context(|| format!("open input device {}", path.display()))?;
@@ -95,11 +123,21 @@ fn capture_device(
             .grab()
             .with_context(|| format!("grab {}", path.display()))?;
     }
+    device
+        .set_nonblocking(true)
+        .with_context(|| format!("set {} nonblocking", path.display()))?;
     tracing::info!(device = %path.display(), name = ?device.name(), grab, "capturing input");
     let _ = ready.send(Ok(()));
 
-    loop {
-        let events: Vec<_> = device.fetch_events()?.collect();
+    while !stop.load(Ordering::Acquire) {
+        let events: Vec<_> = match device.fetch_events() {
+            Ok(events) => events.collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         let mut dx = 0_i32;
         let mut dy = 0_i32;
         for event in events {
@@ -111,12 +149,12 @@ fn capture_device(
                 dy = dy.saturating_add(event.value());
             } else if event_type == EV_KEY || event_type == EV_REL {
                 let sequence = sequence.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-                reliable.blocking_send(ReliableEvent::Input {
+                callback(NativeCapturedEvent::Input {
                     sequence,
                     event_type,
                     code,
                     value: event.value(),
-                })?;
+                });
             }
         }
         if dx != 0 || dy != 0 {
@@ -125,14 +163,15 @@ fn capture_device(
                 .elapsed()
                 .unwrap_or_default()
                 .as_micros() as u64;
-            motion.send_replace(Some(Motion {
+            callback(NativeCapturedEvent::Motion {
                 sequence,
                 timestamp_micros,
                 dx,
                 dy,
-            }));
+            });
         }
     }
+    Ok(())
 }
 
 pub struct Injector {

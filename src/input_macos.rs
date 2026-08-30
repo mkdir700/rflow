@@ -3,22 +3,17 @@ use std::{
     ffi::c_void,
     path::PathBuf,
     sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::SystemTime,
 };
 
+use crate::core::ScreenSize;
 use anyhow::{Result, bail};
-use tokio::sync::{mpsc, watch};
-
-use crate::protocol::{Motion, ReliableEvent};
-use crate::router::ScreenSize;
 
 pub const EV_KEY: u16 = 0x01;
 pub const EV_REL: u16 = 0x02;
-pub const REL_X: u16 = 0x00;
-pub const REL_Y: u16 = 0x01;
 const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
 
@@ -119,6 +114,7 @@ unsafe extern "C" {
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     fn CFRunLoopAddSource(run_loop: CFRunLoopRef, source: CFRunLoopSourceRef, mode: *const c_void);
     fn CFRunLoopRun();
+    fn CFRunLoopStop(run_loop: CFRunLoopRef);
 }
 
 const EVENT_LEFT_DOWN: u32 = 1;
@@ -142,12 +138,29 @@ const FLAG_OPTION: u64 = 1 << 19;
 const FLAG_COMMAND: u64 = 1 << 20;
 
 struct CaptureContext {
-    reliable: mpsc::Sender<ReliableEvent>,
-    motion: watch::Sender<Option<Motion>>,
+    callback: CaptureCallback,
     sequence: AtomicU64,
     modifiers: Mutex<HashSet<u16>>,
     grab: bool,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NativeCapturedEvent {
+    Input {
+        sequence: u64,
+        event_type: u16,
+        code: u16,
+        value: i32,
+    },
+    Motion {
+        sequence: u64,
+        timestamp_micros: u64,
+        dx: i32,
+        dy: i32,
+    },
+}
+
+pub(crate) type CaptureCallback = Arc<dyn Fn(NativeCapturedEvent) + Send + Sync>;
 
 pub fn validate_capture(_paths: &[PathBuf]) -> Result<()> {
     Ok(())
@@ -172,24 +185,19 @@ pub fn cursor_position() -> Option<(i32, i32)> {
 pub fn spawn_capture(
     _paths: Vec<PathBuf>,
     grab: bool,
-    reliable: mpsc::Sender<ReliableEvent>,
-    motion: watch::Sender<Option<Motion>>,
+    callback: CaptureCallback,
+    stop: Arc<AtomicBool>,
 ) -> Result<Vec<std::thread::JoinHandle<()>>> {
     Ok(vec![std::thread::spawn(move || {
-        if let Err(error) = capture_events(grab, reliable, motion) {
+        if let Err(error) = capture_events(grab, callback, stop) {
             tracing::error!(%error, "macOS input capture stopped");
         }
     })])
 }
 
-fn capture_events(
-    grab: bool,
-    reliable: mpsc::Sender<ReliableEvent>,
-    motion: watch::Sender<Option<Motion>>,
-) -> Result<()> {
+fn capture_events(grab: bool, callback: CaptureCallback, stop: Arc<AtomicBool>) -> Result<()> {
     let context = Box::new(CaptureContext {
-        reliable,
-        motion,
+        callback,
         sequence: AtomicU64::new(0),
         modifiers: Mutex::new(HashSet::new()),
         grab,
@@ -235,10 +243,18 @@ fn capture_events(
         }
         bail!("create macOS event-tap run-loop source");
     }
+    let run_loop = unsafe { CFRunLoopGetCurrent() };
     unsafe {
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
+        CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
         CGEventTapEnable(tap, true);
     }
+    let stop_run_loop = run_loop as usize;
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        unsafe { CFRunLoopStop(stop_run_loop as CFRunLoopRef) };
+    });
     tracing::info!(grab, "capturing macOS keyboard and mouse input");
     unsafe { CFRunLoopRun() };
     unsafe {
@@ -275,12 +291,12 @@ fn handle_captured_event(context: &CaptureContext, event_type: u32, event: CGEve
                     .elapsed()
                     .unwrap_or_default()
                     .as_micros() as u64;
-                context.motion.send_replace(Some(Motion {
+                (context.callback)(NativeCapturedEvent::Motion {
                     sequence,
                     timestamp_micros,
                     dx,
                     dy,
-                }));
+                });
             }
         }
         EVENT_LEFT_DOWN => send_key(context, 272, 1),
@@ -359,15 +375,13 @@ fn send_key(context: &CaptureContext, code: u16, value: i32) {
 }
 
 fn send_reliable(context: &CaptureContext, event_type: u16, code: u16, value: i32) {
-    let event = ReliableEvent::Input {
+    let event = NativeCapturedEvent::Input {
         sequence: next_sequence(context),
         event_type,
         code,
         value,
     };
-    if let Err(error) = context.reliable.blocking_send(event) {
-        tracing::warn!(%error, "drop captured macOS input after transport closed");
-    }
+    (context.callback)(event);
 }
 
 #[derive(Default)]

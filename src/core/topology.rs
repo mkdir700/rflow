@@ -1,4 +1,15 @@
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenSizeParseError(String);
+
+impl fmt::Display for ScreenSizeParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ScreenSizeParseError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScreenSize {
@@ -16,37 +27,37 @@ impl ScreenSize {
 }
 
 impl FromStr for ScreenSize {
-    type Err = String;
+    type Err = ScreenSizeParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let (width, height) = value
             .split_once('x')
-            .ok_or_else(|| "screen size must use WIDTHxHEIGHT".to_owned())?;
+            .ok_or_else(|| ScreenSizeParseError("screen size must use WIDTHxHEIGHT".to_owned()))?;
         let width = width
             .parse()
-            .map_err(|_| "invalid screen width".to_owned())?;
+            .map_err(|_| ScreenSizeParseError("invalid screen width".to_owned()))?;
         let height = height
             .parse()
-            .map_err(|_| "invalid screen height".to_owned())?;
-        Self::new(width, height).map_err(str::to_owned)
+            .map_err(|_| ScreenSizeParseError("invalid screen height".to_owned()))?;
+        Self::new(width, height).map_err(|error| ScreenSizeParseError(error.to_owned()))
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActiveScreen {
+pub(crate) enum ActiveScreen {
     Local,
     Remote,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Route {
+pub(crate) enum Route {
     Local { dx: i32, dy: i32 },
     Remote { dx: i32, dy: i32 },
     EnterRemote { x: i32, y: i32 },
     EnterLocal { x: i32, y: i32 },
 }
 
-pub struct CursorRouter {
+pub(crate) struct CursorRouter {
     local: ScreenSize,
     remote: ScreenSize,
     active: ActiveScreen,
@@ -55,7 +66,7 @@ pub struct CursorRouter {
 }
 
 impl CursorRouter {
-    pub fn right(local: ScreenSize, remote: ScreenSize) -> Self {
+    pub(crate) fn right(local: ScreenSize, remote: ScreenSize) -> Self {
         Self {
             local,
             remote,
@@ -65,17 +76,18 @@ impl CursorRouter {
         }
     }
 
-    pub fn active(&self) -> ActiveScreen {
+    #[cfg(test)]
+    fn active(&self) -> ActiveScreen {
         self.active
     }
 
-    pub fn set_local_position(&mut self, x: i32, y: i32) {
+    pub(crate) fn set_local_position(&mut self, x: i32, y: i32) {
         self.active = ActiveScreen::Local;
         self.x = x.clamp(0, self.local.width - 1);
         self.y = y.clamp(0, self.local.height - 1);
     }
 
-    pub fn route_motion(&mut self, dx: i32, dy: i32) -> Route {
+    pub(crate) fn route_motion(&mut self, dx: i32, dy: i32) -> Route {
         match self.active {
             ActiveScreen::Local => self.route_local(dx, dy),
             ActiveScreen::Remote => self.route_remote(dx, dy),
