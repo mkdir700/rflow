@@ -161,7 +161,7 @@ fn secure_directory(_path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn application_config_directory() -> Result<PathBuf> {
+pub fn application_config_directory() -> Result<PathBuf> {
     if let Some(directory) = env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(directory).join("rflow"));
     }
@@ -170,20 +170,20 @@ fn application_config_directory() -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn application_config_directory() -> Result<PathBuf> {
+pub fn application_config_directory() -> Result<PathBuf> {
     let home = env::var_os("HOME").context("HOME is not set; cannot locate rflow configuration")?;
     Ok(PathBuf::from(home).join("Library/Application Support/rflow"))
 }
 
 #[cfg(target_os = "windows")]
-fn application_config_directory() -> Result<PathBuf> {
+pub fn application_config_directory() -> Result<PathBuf> {
     let app_data =
         env::var_os("APPDATA").context("APPDATA is not set; cannot locate rflow configuration")?;
     Ok(PathBuf::from(app_data).join("rflow"))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn application_config_directory() -> Result<PathBuf> {
+pub fn application_config_directory() -> Result<PathBuf> {
     bail!("automatic identity storage is unsupported on this platform")
 }
 

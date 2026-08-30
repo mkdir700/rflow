@@ -16,3 +16,4 @@ pub mod protocol;
 pub mod runtime;
 pub mod target;
 pub mod transport;
+pub mod trust;

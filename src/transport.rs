@@ -1,11 +1,147 @@
 use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use quinn::{ClientConfig, Connection, Endpoint, ServerConfig, TransportConfig, VarInt};
-use rustls::RootCertStore;
+use quinn::{
+    ClientConfig, Connection, Endpoint, ServerConfig, TransportConfig, VarInt,
+    crypto::rustls::{QuicClientConfig, QuicServerConfig},
+};
+use rustls::{
+    CertificateError, DigitallySignedStruct, DistinguishedName, RootCertStore, SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::CryptoProvider,
+    pki_types::{ServerName, UnixTime},
+    server::danger::{ClientCertVerified, ClientCertVerifier},
+};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 use crate::identity::{IdentityPaths, TLS_SERVER_NAME};
+
+const PAIRING_ALPN: &[u8] = b"rflow-pairing/1";
+
+#[derive(Debug)]
+struct PairingServerVerifier {
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for PairingServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        validate_pairing_chain(end_entity, intermediates)?;
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::PeerIncompatible(
+            rustls::PeerIncompatible::Tls12NotOffered,
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+#[derive(Debug)]
+struct PairingClientVerifier {
+    provider: Arc<CryptoProvider>,
+}
+
+impl ClientCertVerifier for PairingClientVerifier {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> std::result::Result<ClientCertVerified, rustls::Error> {
+        validate_pairing_chain(end_entity, intermediates)?;
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::PeerIncompatible(
+            rustls::PeerIncompatible::Tls12NotOffered,
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn validate_pairing_chain(
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+) -> std::result::Result<(), rustls::Error> {
+    if end_entity.is_empty() {
+        return Err(rustls::Error::InvalidCertificate(
+            CertificateError::BadEncoding,
+        ));
+    }
+    if !intermediates.is_empty() {
+        return Err(rustls::Error::InvalidCertificate(
+            CertificateError::UnknownIssuer,
+        ));
+    }
+    Ok(())
+}
+
+fn pairing_crypto_provider() -> Arc<CryptoProvider> {
+    CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+}
 
 fn transport_config() -> Result<Arc<TransportConfig>> {
     let mut transport = TransportConfig::default();
@@ -37,6 +173,70 @@ pub fn client_endpoint(bind: SocketAddr, cert_path: &Path) -> Result<Endpoint> {
     let mut endpoint = Endpoint::client(bind).context("bind QUIC client")?;
     endpoint.set_default_client_config(config);
     Ok(endpoint)
+}
+
+pub fn pairing_server_endpoint(bind: SocketAddr, identity: &IdentityPaths) -> Result<Endpoint> {
+    let (certificate, private_key) = load_identity(identity)?;
+    let provider = pairing_crypto_provider();
+    let verifier = Arc::new(PairingClientVerifier {
+        provider: provider.clone(),
+    });
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(vec![certificate], private_key)
+        .context("configure pairing server identity")?;
+    tls.alpn_protocols = vec![PAIRING_ALPN.to_vec()];
+    let crypto = QuicServerConfig::try_from(tls).context("configure pairing QUIC server")?;
+    let mut config = ServerConfig::with_crypto(Arc::new(crypto));
+    config.transport_config(transport_config()?);
+    Endpoint::server(config, bind).context("bind pairing QUIC server")
+}
+
+pub fn pairing_client_endpoint(bind: SocketAddr, identity: &IdentityPaths) -> Result<Endpoint> {
+    let (certificate, private_key) = load_identity(identity)?;
+    let provider = pairing_crypto_provider();
+    let verifier = Arc::new(PairingServerVerifier {
+        provider: provider.clone(),
+    });
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(vec![certificate], private_key)
+        .context("configure pairing client identity")?;
+    tls.alpn_protocols = vec![PAIRING_ALPN.to_vec()];
+    let crypto = QuicClientConfig::try_from(tls).context("configure pairing QUIC client")?;
+    let mut config = ClientConfig::new(Arc::new(crypto));
+    config.transport_config(transport_config()?);
+    let mut endpoint = Endpoint::client(bind).context("bind pairing QUIC client")?;
+    endpoint.set_default_client_config(config);
+    Ok(endpoint)
+}
+
+pub fn peer_certificate(connection: &Connection) -> Result<Vec<u8>> {
+    let identity = connection
+        .peer_identity()
+        .context("peer did not present a TLS identity")?;
+    let certificates = identity
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .map_err(|_| anyhow::anyhow!("unsupported TLS peer identity type"))?;
+    let certificate = certificates
+        .first()
+        .context("peer presented an empty certificate chain")?;
+    Ok(certificate.as_ref().to_vec())
+}
+
+fn load_identity(
+    identity: &IdentityPaths,
+) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+    let certificate = CertificateDer::from(
+        fs::read(&identity.certificate).context("read device identity certificate")?,
+    );
+    let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+        fs::read(&identity.private_key).context("read device identity private key")?,
+    ));
+    Ok((certificate, private_key))
 }
 
 pub async fn accept_one(endpoint: &Endpoint) -> Result<Connection> {
@@ -90,5 +290,34 @@ mod tests {
             .send_datagram(bytes::Bytes::from_static(b"rflow"))
             .unwrap();
         assert_eq!(&receiving.read_datagram().await.unwrap()[..], b"rflow");
+    }
+
+    #[tokio::test]
+    async fn pairing_transport_proves_both_device_keys_and_exposes_certificates() {
+        let directory = tempfile::tempdir().unwrap();
+        let server_identity = IdentityPaths::in_directory(directory.path().join("server"));
+        let client_identity = IdentityPaths::in_directory(directory.path().join("client"));
+        crate::identity::ensure_identity(&server_identity).unwrap();
+        crate::identity::ensure_identity(&client_identity).unwrap();
+        let server_certificate = fs::read(&server_identity.certificate).unwrap();
+        let client_certificate = fs::read(&client_identity.certificate).unwrap();
+
+        let server = pairing_server_endpoint(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            &server_identity,
+        )
+        .unwrap();
+        let remote = server.local_addr().unwrap();
+        let accept = tokio::spawn(async move { accept_one(&server).await.unwrap() });
+        let client = pairing_client_endpoint(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            &client_identity,
+        )
+        .unwrap();
+        let sending = connect(&client, remote).await.unwrap();
+        let receiving = accept.await.unwrap();
+
+        assert_eq!(peer_certificate(&sending).unwrap(), server_certificate);
+        assert_eq!(peer_certificate(&receiving).unwrap(), client_certificate);
     }
 }
