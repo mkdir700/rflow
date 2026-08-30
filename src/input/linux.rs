@@ -435,6 +435,7 @@ fn capture_device(
 pub struct Injector {
     devices: Vec<VirtualDevice>,
     pointer_source: usize,
+    physical_keyboard_profiles: Vec<HyprKeyboard>,
 }
 
 impl Injector {
@@ -443,6 +444,7 @@ impl Injector {
             return Ok(Self {
                 devices: vec![generic_remote_device()?],
                 pointer_source: 0,
+                physical_keyboard_profiles: Vec::new(),
             });
         }
         let hypr_before = hypr_keyboards();
@@ -487,6 +489,7 @@ impl Injector {
         Ok(Self {
             devices,
             pointer_source: pointer_source.unwrap_or(0),
+            physical_keyboard_profiles: keyboard_profiles,
         })
     }
 
@@ -538,6 +541,18 @@ impl Injector {
         self.devices
             .get_mut(source)
             .with_context(|| format!("input source {source} has no virtual device"))
+    }
+}
+
+impl Drop for Injector {
+    fn drop(&mut self) {
+        // Remove the uinput clones before rebuilding the physical keymaps. Hyprland
+        // otherwise keeps the keymap state from the grabbed-device lifecycle even
+        // though `hyprctl devices` still reports the configured options.
+        self.devices.clear();
+        for profile in &self.physical_keyboard_profiles {
+            apply_hypr_keyboard_profile(&profile.name, profile);
+        }
     }
 }
 
@@ -612,8 +627,25 @@ fn virtual_device_name_matches(candidate: &str, physical: &str) -> bool {
 }
 
 fn apply_hypr_keyboard_profile(name: &str, profile: &HyprKeyboard) {
+    let lua = hypr_keyboard_lua(name, profile);
+    match Command::new("hyprctl").args(["eval", &lua]).output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => tracing::warn!(
+            keyboard = name,
+            error = %String::from_utf8_lossy(&output.stderr),
+            "failed to apply keyboard settings in Hyprland"
+        ),
+        Err(error) => tracing::warn!(
+            keyboard = name,
+            %error,
+            "failed to invoke Hyprland while configuring keyboard"
+        ),
+    }
+}
+
+fn hypr_keyboard_lua(name: &str, profile: &HyprKeyboard) -> String {
     let string = |value: &str| serde_json::to_string(value).expect("serialize Hyprland string");
-    let lua = format!(
+    format!(
         "hl.device({{ name = {}, kb_rules = {}, kb_model = {}, kb_layout = {}, kb_variant = {}, kb_options = {} }})",
         string(name),
         string(&profile.rules),
@@ -621,20 +653,7 @@ fn apply_hypr_keyboard_profile(name: &str, profile: &HyprKeyboard) {
         string(&profile.layout),
         string(&profile.variant),
         string(&profile.options),
-    );
-    match Command::new("hyprctl").args(["eval", &lua]).output() {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => tracing::warn!(
-            keyboard = name,
-            error = %String::from_utf8_lossy(&output.stderr),
-            "failed to apply physical keyboard settings to virtual keyboard"
-        ),
-        Err(error) => tracing::warn!(
-            keyboard = name,
-            %error,
-            "failed to invoke Hyprland while configuring virtual keyboard"
-        ),
-    }
+    )
 }
 
 fn forwarded_relative_axes(
@@ -724,6 +743,24 @@ mod discovery_tests {
             "hhkb-hybrid_3-keyboard-pro-1",
             "hhkb-hybrid_3-keyboard"
         ));
+    }
+
+    #[test]
+    fn physical_keyboard_restore_reuses_the_captured_xkb_profile() {
+        let profile = HyprKeyboard {
+            address: "0x1".to_owned(),
+            name: "hhkb-hybrid_3-keyboard".to_owned(),
+            rules: String::new(),
+            model: String::new(),
+            layout: "us".to_owned(),
+            variant: String::new(),
+            options: "altwin:swap_alt_win".to_owned(),
+        };
+
+        assert_eq!(
+            hypr_keyboard_lua(&profile.name, &profile),
+            "hl.device({ name = \"hhkb-hybrid_3-keyboard\", kb_rules = \"\", kb_model = \"\", kb_layout = \"us\", kb_variant = \"\", kb_options = \"altwin:swap_alt_win\" })"
+        );
     }
 
     #[test]
