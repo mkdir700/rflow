@@ -514,8 +514,8 @@ impl Injector {
         let lua = format!("hl.dispatch(hl.dsp.cursor.move({{ x = {x}, y = {y} }}))");
         if Command::new("hyprctl")
             .args(["eval", &lua])
-            .status()
-            .is_ok_and(|status| status.success())
+            .output()
+            .is_ok_and(|output| output.status.success())
         {
             return Ok(());
         }
