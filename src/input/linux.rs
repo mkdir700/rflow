@@ -593,27 +593,48 @@ fn sync_hypr_keyboard_profiles(before: &[HyprKeyboard], profiles: &[HyprKeyboard
         .iter()
         .map(|keyboard| keyboard.address.as_str())
         .collect();
-    for _ in 0..20 {
+    let mut stable_reads = vec![0_u8; profiles.len()];
+    for _ in 0..40 {
         if let Some(current) = hypr_keyboards() {
             let mut pending = false;
-            for profile in profiles {
+            for (index, profile) in profiles.iter().enumerate() {
                 let virtual_keyboard = current.iter().find(|keyboard| {
                     !old_addresses.contains(keyboard.address.as_str())
                         && virtual_device_name_matches(&keyboard.name, &profile.name)
                 });
                 if let Some(virtual_keyboard) = virtual_keyboard {
-                    apply_hypr_keyboard_profile(&virtual_keyboard.name, profile);
+                    if same_keymap(virtual_keyboard, profile) {
+                        stable_reads[index] = stable_reads[index].saturating_add(1);
+                        pending |= stable_reads[index] < 4;
+                    } else {
+                        stable_reads[index] = 0;
+                        pending = true;
+                        apply_hypr_keyboard_profile(&virtual_keyboard.name, profile);
+                    }
                 } else {
+                    stable_reads[index] = 0;
                     pending = true;
                 }
             }
             if !pending {
+                tracing::info!(
+                    keyboards = profiles.len(),
+                    "synchronized virtual keyboard settings with Hyprland"
+                );
                 return;
             }
         }
         thread::sleep(Duration::from_millis(25));
     }
     tracing::warn!("timed out synchronizing virtual keyboard settings with Hyprland");
+}
+
+fn same_keymap(left: &HyprKeyboard, right: &HyprKeyboard) -> bool {
+    left.rules == right.rules
+        && left.model == right.model
+        && left.layout == right.layout
+        && left.variant == right.variant
+        && left.options == right.options
 }
 
 fn virtual_device_name_matches(candidate: &str, physical: &str) -> bool {
@@ -761,6 +782,26 @@ mod discovery_tests {
             hypr_keyboard_lua(&profile.name, &profile),
             "hl.device({ name = \"hhkb-hybrid_3-keyboard\", kb_rules = \"\", kb_model = \"\", kb_layout = \"us\", kb_variant = \"\", kb_options = \"altwin:swap_alt_win\" })"
         );
+    }
+
+    #[test]
+    fn keymap_verification_detects_a_late_hyprland_override() {
+        let expected = HyprKeyboard {
+            address: "physical".to_owned(),
+            name: "hhkb-hybrid_3-keyboard".to_owned(),
+            rules: String::new(),
+            model: String::new(),
+            layout: "us".to_owned(),
+            variant: String::new(),
+            options: "altwin:swap_alt_win".to_owned(),
+        };
+        let mut actual = expected.clone();
+        actual.address = "virtual".to_owned();
+        actual.name = "hhkb-hybrid_3-keyboard-1".to_owned();
+        assert!(same_keymap(&actual, &expected));
+
+        actual.options = "ctrl:nocaps".to_owned();
+        assert!(!same_keymap(&actual, &expected));
     }
 
     #[test]
