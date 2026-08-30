@@ -1,4 +1,5 @@
 use std::{
+    fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     sync::Arc,
@@ -8,12 +9,18 @@ use std::{
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
+use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, watch};
 
 use crate::{
     core::{
         ControlTarget, DesktopSession, Motion, ScreenDirection, ScreenSize, SessionEffect,
         SessionEvent,
+    },
+    identity::IdentityPaths,
+    pairing::{
+        PAIRING_PROTOCOL_VERSION, PairingCode, PairingMaterial, PairingMessage, PairingRequestId,
+        PairingRole, pairing_proof,
     },
     platform::{self, CapturedEvent, InputInjector},
     protocol::{
@@ -22,6 +29,7 @@ use crate::{
     },
     target::ServerTarget,
     transport,
+    trust::{DeviceId, TrustStore, VerifyPeer},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +40,8 @@ pub struct HostConfig {
     pub size: ScreenSize,
     pub devices: Vec<PathBuf>,
     pub direction: Option<ScreenDirection>,
+    pub device_name: String,
+    pub trust_store: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,9 +49,21 @@ pub struct ClientConfig {
     pub target: ServerTarget,
     pub identity_cert: PathBuf,
     pub identity_key: PathBuf,
-    pub server_cert: PathBuf,
+    pub server_cert: Option<PathBuf>,
     pub size: Option<ScreenSize>,
     pub retry_for: Duration,
+    pub device_name: String,
+    pub trust_store: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingRequestSummary {
+    pub request_id: PairingRequestId,
+    pub device_name: String,
+    pub address: SocketAddr,
+    pub fingerprint: DeviceId,
+    pub code: PairingCode,
+    pub expires_in: Duration,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -58,6 +80,8 @@ pub enum AppCommand {
     StartClient(ClientConfig),
     Stop,
     UpdateConfig(AppConfig),
+    AcceptPairing(PairingRequestId),
+    RejectPairing(PairingRequestId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +89,7 @@ pub enum RuntimeStatus {
     Stopped,
     Starting,
     Listening,
+    PairingPending,
     Connecting,
     Connected,
     Retrying,
@@ -98,6 +123,9 @@ pub enum AppEvent {
     PeerChanged(Option<SocketAddr>),
     ControlChanged(ControlTarget),
     ConfigChanged(Box<AppConfig>),
+    PairingRequested(Box<PairingRequestSummary>),
+    PairingCodeReady(Box<PairingRequestSummary>),
+    PairingCleared(PairingRequestId),
     Faulted(AppFault),
 }
 
@@ -108,6 +136,7 @@ pub struct RuntimeSnapshot {
     pub control: Option<ControlTarget>,
     pub config: AppConfig,
     pub fault: Option<AppFault>,
+    pub pairing: Option<PairingRequestSummary>,
 }
 
 impl Default for RuntimeSnapshot {
@@ -118,6 +147,7 @@ impl Default for RuntimeSnapshot {
             control: None,
             config: AppConfig::default(),
             fault: None,
+            pairing: None,
         }
     }
 }
@@ -155,6 +185,17 @@ impl AppEventBus {
             AppEvent::PeerChanged(peer) => snapshot.peer = *peer,
             AppEvent::ControlChanged(control) => snapshot.control = Some(*control),
             AppEvent::ConfigChanged(config) => snapshot.config = (**config).clone(),
+            AppEvent::PairingRequested(request) => snapshot.pairing = Some((**request).clone()),
+            AppEvent::PairingCodeReady(request) => snapshot.pairing = Some((**request).clone()),
+            AppEvent::PairingCleared(request_id) => {
+                if snapshot
+                    .pairing
+                    .as_ref()
+                    .is_some_and(|request| request.request_id == *request_id)
+                {
+                    snapshot.pairing = None;
+                }
+            }
             AppEvent::Faulted(fault) => snapshot.fault = Some(fault.clone()),
         }
     }
@@ -326,15 +367,24 @@ async fn supervisor(
                 events.send(AppEvent::ConfigChanged(Box::new(config))).await;
                 continue;
             }
+            AppCommand::AcceptPairing(_) | AppCommand::RejectPairing(_) => continue,
         };
         publish_status(&events, RuntimeStatus::Starting).await;
         let (stop_tx, stop_rx) = watch::channel(false);
+        let (pairing_tx, pairing_rx) = mpsc::channel(8);
         let session_events = events.clone();
         let session_diagnostics = diagnostics.clone();
         let mut task = tokio::spawn(async move {
             match session {
                 SessionKind::Host(config) => {
-                    run_host(config, stop_rx, session_events, session_diagnostics).await
+                    run_host(
+                        config,
+                        stop_rx,
+                        pairing_rx,
+                        session_events,
+                        session_diagnostics,
+                    )
+                    .await
                 }
                 SessionKind::Client(config) => {
                     run_client(config, stop_rx, session_events, session_diagnostics).await
@@ -360,6 +410,22 @@ async fn supervisor(
                             .send(AppEvent::ConfigChanged(Box::new(config)))
                             .await;
                     }
+                    Some(AppCommand::AcceptPairing(request_id)) => {
+                        let _ = pairing_tx
+                            .send(PairingDecision {
+                                request_id,
+                                accepted: true,
+                            })
+                            .await;
+                    }
+                    Some(AppCommand::RejectPairing(request_id)) => {
+                        let _ = pairing_tx
+                            .send(PairingDecision {
+                                request_id,
+                                accepted: false,
+                            })
+                            .await;
+                    }
                     Some(AppCommand::StartHost(_)) | Some(AppCommand::StartClient(_)) => {
                         let fault = AppFault {
                             kind: FaultKind::InvalidConfiguration,
@@ -376,6 +442,11 @@ async fn supervisor(
 enum SessionKind {
     Host(HostConfig),
     Client(ClientConfig),
+}
+
+struct PairingDecision {
+    request_id: PairingRequestId,
+    accepted: bool,
 }
 
 async fn finish_session(
@@ -434,6 +505,7 @@ async fn publish_status(events: &AppEventBus, status: RuntimeStatus) {
 async fn run_host(
     config: HostConfig,
     mut stop: watch::Receiver<bool>,
+    mut pairing_decisions: mpsc::Receiver<PairingDecision>,
     events: AppEventBus,
     _diagnostics: Arc<dyn DiagnosticSink>,
 ) -> Result<()> {
@@ -441,26 +513,176 @@ async fn run_host(
         .direction
         .context("screen direction is required; pass --direction")?;
     platform::validate_capture(&config.devices)?;
-    let endpoint = transport::server_endpoint(config.bind, &config.cert, &config.key)?;
+    let identity = IdentityPaths {
+        certificate: config.cert.clone(),
+        private_key: config.key.clone(),
+    };
+    let endpoint = transport::pairing_server_endpoint(config.bind, &identity)?;
+    let mut trust = TrustStore::load(&config.trust_store)?;
     tracing::info!(local = %endpoint.local_addr()?, "host listening");
     publish_status(&events, RuntimeStatus::Listening).await;
-    let connection = tokio::select! {
-        connection = transport::accept_one(&endpoint) => connection?,
-        _ = wait_for_stop(&mut stop) => return Ok(()),
-    };
+    loop {
+        let connection = tokio::select! {
+            connection = transport::accept_one(&endpoint) => connection?,
+            _ = wait_for_stop(&mut stop) => return Ok(()),
+        };
+        let remote = connection.remote_address();
+        if !authorize_host_peer(
+            &connection,
+            &config,
+            &mut trust,
+            &mut pairing_decisions,
+            &mut stop,
+            &events,
+        )
+        .await?
+        {
+            connection.close(0_u32.into(), b"pairing rejected");
+            if *stop.borrow() {
+                return Ok(());
+            }
+            publish_status(&events, RuntimeStatus::Listening).await;
+            continue;
+        }
+        events.send(AppEvent::PeerChanged(Some(remote))).await;
+        publish_status(&events, RuntimeStatus::Connected).await;
+        tracing::info!(%remote, "client connected");
+        return run_host_connection(
+            connection,
+            config.size,
+            config.devices,
+            direction,
+            stop,
+            events,
+        )
+        .await;
+    }
+}
+
+async fn authorize_host_peer(
+    connection: &Connection,
+    config: &HostConfig,
+    trust: &mut TrustStore,
+    decisions: &mut mpsc::Receiver<PairingDecision>,
+    stop: &mut watch::Receiver<bool>,
+    events: &AppEventBus,
+) -> Result<bool> {
     let remote = connection.remote_address();
-    events.send(AppEvent::PeerChanged(Some(remote))).await;
-    publish_status(&events, RuntimeStatus::Connected).await;
-    tracing::info!(%remote, "client connected");
-    run_host_connection(
-        connection,
-        config.size,
-        config.devices,
-        direction,
-        stop,
-        events,
+    let peer_certificate = transport::peer_certificate(connection)?;
+    let local_certificate = fs::read(&config.cert).context("read host identity certificate")?;
+    let (mut send, mut receive) = tokio::select! {
+        stream = connection.accept_bi() => stream.context("accept pairing stream")?,
+        _ = wait_for_stop(stop) => return Ok(false),
+    };
+    let client_message: PairingMessage = read_typed_frame(&mut receive).await?;
+    let (client_name, client_material) =
+        validate_pairing_hello(client_message, PairingRole::Client, peer_certificate)?;
+    let server_material = PairingMaterial::generate(PairingRole::Server, local_certificate)?;
+    write_typed_frame(
+        &mut send,
+        &server_material.hello(config.device_name.clone()),
     )
-    .await
+    .await?;
+    let proof = pairing_proof(&server_material, &client_material)?;
+
+    if matches!(
+        trust.verify_certificate(&client_material.certificate),
+        VerifyPeer::Trusted(_)
+    ) {
+        write_typed_frame(&mut send, &PairingMessage::Accepted).await?;
+        expect_pairing_acknowledgement(&mut receive).await?;
+        send.finish().context("finish pairing stream")?;
+        return Ok(true);
+    }
+
+    let request = PairingRequestSummary {
+        request_id: proof.request_id,
+        device_name: client_name.clone(),
+        address: remote,
+        fingerprint: DeviceId::from_certificate(&client_material.certificate),
+        code: proof.code,
+        expires_in: Duration::from_secs(120),
+    };
+    publish_status(events, RuntimeStatus::PairingPending).await;
+    events
+        .send(AppEvent::PairingRequested(Box::new(request)))
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let accepted = loop {
+        tokio::select! {
+            decision = decisions.recv() => match decision {
+                Some(decision) if decision.request_id == proof.request_id => break decision.accepted,
+                Some(_) => continue,
+                None => break false,
+            },
+            _ = tokio::time::sleep_until(deadline) => break false,
+            _ = wait_for_stop(stop) => break false,
+            _ = connection.closed() => break false,
+        }
+    };
+    events
+        .send(AppEvent::PairingCleared(proof.request_id))
+        .await;
+    if !accepted {
+        let _ = write_typed_frame(&mut send, &PairingMessage::Rejected).await;
+        return Ok(false);
+    }
+    trust.remember(client_name, &client_material.certificate, unix_timestamp()?)?;
+    write_typed_frame(&mut send, &PairingMessage::Accepted).await?;
+    expect_pairing_acknowledgement(&mut receive).await?;
+    send.finish().context("finish pairing stream")?;
+    Ok(true)
+}
+
+async fn expect_pairing_acknowledgement(receive: &mut RecvStream) -> Result<()> {
+    match read_typed_frame::<PairingMessage>(receive).await? {
+        PairingMessage::Acknowledged => Ok(()),
+        _ => bail!("client did not acknowledge persisted pairing state"),
+    }
+}
+
+fn validate_pairing_hello(
+    message: PairingMessage,
+    expected_role: PairingRole,
+    certificate: Vec<u8>,
+) -> Result<(String, PairingMaterial)> {
+    let PairingMessage::Hello {
+        version,
+        role,
+        device_name,
+        nonce,
+        certificate_fingerprint,
+    } = message
+    else {
+        bail!("first pairing message must be Hello")
+    };
+    if version != PAIRING_PROTOCOL_VERSION {
+        bail!("unsupported pairing protocol version {version}");
+    }
+    if role != expected_role {
+        bail!("pairing peer sent the wrong role");
+    }
+    if certificate_fingerprint != DeviceId::from_certificate(&certificate) {
+        bail!("pairing certificate fingerprint does not match TLS identity");
+    }
+    if device_name.trim().is_empty() || device_name.len() > 128 {
+        bail!("pairing device name must contain 1 to 128 bytes");
+    }
+    Ok((
+        device_name,
+        PairingMaterial {
+            role,
+            certificate,
+            nonce,
+        },
+    ))
+}
+
+fn unix_timestamp() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs())
 }
 
 async fn run_host_connection(
@@ -592,7 +814,7 @@ async fn execute_host_effects(
 }
 
 async fn run_client(
-    config: ClientConfig,
+    mut config: ClientConfig,
     mut stop: watch::Receiver<bool>,
     events: AppEventBus,
     diagnostics: Arc<dyn DiagnosticSink>,
@@ -601,13 +823,19 @@ async fn run_client(
         Some(size) => size,
         None => platform::screen_size()?,
     };
+    config.size = Some(size);
     let target = config.target.resolve().await?;
     let bind_ip = if target.is_ipv4() {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
     } else {
         IpAddr::V6(Ipv6Addr::UNSPECIFIED)
     };
-    let endpoint = transport::client_endpoint(SocketAddr::new(bind_ip, 0), &config.server_cert)?;
+    let identity = IdentityPaths {
+        certificate: config.identity_cert.clone(),
+        private_key: config.identity_key.clone(),
+    };
+    let endpoint = transport::pairing_client_endpoint(SocketAddr::new(bind_ip, 0), &identity)?;
+    let mut trust = TrustStore::load(&config.trust_store)?;
     let retry_deadline = tokio::time::Instant::now() + config.retry_for;
     let mut attempt = 0_u32;
     loop {
@@ -620,7 +848,8 @@ async fn run_client(
         let result = run_client_once(
             &endpoint,
             target,
-            size,
+            &config,
+            &mut trust,
             stop.clone(),
             events.clone(),
             diagnostics.clone(),
@@ -650,15 +879,22 @@ async fn run_client(
 async fn run_client_once(
     endpoint: &Endpoint,
     remote: SocketAddr,
-    size: ScreenSize,
+    config: &ClientConfig,
+    trust: &mut TrustStore,
     mut stop: watch::Receiver<bool>,
     events: AppEventBus,
     diagnostics: Arc<dyn DiagnosticSink>,
 ) -> Result<()> {
+    let size = config
+        .size
+        .context("client screen size was not resolved before connection")?;
     let connection = tokio::select! {
         connection = transport::connect(endpoint, remote) => connection?,
         _ = wait_for_stop(&mut stop) => return Ok(()),
     };
+    if !authorize_server_peer(&connection, config, trust, &events, &mut stop).await? {
+        return Ok(());
+    }
     tracing::info!(%remote, width = size.width, height = size.height, "connected to host");
     events.send(AppEvent::PeerChanged(Some(remote))).await;
     events.try_send(AppEvent::ControlChanged(ControlTarget::Remote));
@@ -690,6 +926,83 @@ async fn run_client_once(
         _ => bail!("first host message must be Hello"),
     }
     run_client_connection(connection, stream, stop, diagnostics).await
+}
+
+async fn authorize_server_peer(
+    connection: &Connection,
+    config: &ClientConfig,
+    trust: &mut TrustStore,
+    events: &AppEventBus,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<bool> {
+    let remote = connection.remote_address();
+    let peer_certificate = transport::peer_certificate(connection)?;
+    let local_certificate =
+        fs::read(&config.identity_cert).context("read client identity certificate")?;
+    let client_material = PairingMaterial::generate(PairingRole::Client, local_certificate)?;
+    let (mut send, mut receive) = connection.open_bi().await.context("open pairing stream")?;
+    write_typed_frame(
+        &mut send,
+        &client_material.hello(config.device_name.clone()),
+    )
+    .await?;
+    let server_message: PairingMessage = tokio::select! {
+        message = read_typed_frame(&mut receive) => message?,
+        _ = wait_for_stop(stop) => return Ok(false),
+    };
+    let (server_name, server_material) =
+        validate_pairing_hello(server_message, PairingRole::Server, peer_certificate)?;
+    let proof = pairing_proof(&server_material, &client_material)?;
+    let endpoint = config.target.to_string();
+    let verification = trust.verify_endpoint(&endpoint, &server_material.certificate);
+    if let VerifyPeer::IdentityChanged { expected, observed } = verification {
+        bail!(
+            "SECURITY ERROR: identity for {endpoint} changed; expected {expected}, received {observed}; forget the old peer before pairing again"
+        );
+    }
+    if let Some(pinned_path) = &config.server_cert {
+        let pinned = fs::read(pinned_path).context("read pinned server certificate")?;
+        if pinned != server_material.certificate {
+            bail!("SECURITY ERROR: server certificate does not match --server-cert");
+        }
+    }
+    if matches!(verification, VerifyPeer::Unknown(_)) {
+        events
+            .send(AppEvent::PairingCodeReady(Box::new(
+                PairingRequestSummary {
+                    request_id: proof.request_id,
+                    device_name: server_name.clone(),
+                    address: remote,
+                    fingerprint: DeviceId::from_certificate(&server_material.certificate),
+                    code: proof.code,
+                    expires_in: Duration::from_secs(120),
+                },
+            )))
+            .await;
+    }
+    let decision: PairingMessage = tokio::select! {
+        message = read_typed_frame(&mut receive) => message?,
+        _ = tokio::time::sleep(Duration::from_secs(120)) => bail!("pairing request expired"),
+        _ = wait_for_stop(stop) => return Ok(false),
+    };
+    events
+        .send(AppEvent::PairingCleared(proof.request_id))
+        .await;
+    match decision {
+        PairingMessage::Accepted => {}
+        PairingMessage::Rejected => bail!("pairing request rejected by server"),
+        PairingMessage::Hello { .. } | PairingMessage::Acknowledged => {
+            bail!("server sent an invalid pairing decision")
+        }
+    }
+    if matches!(verification, VerifyPeer::Unknown(_)) {
+        let device_id =
+            trust.remember(server_name, &server_material.certificate, unix_timestamp()?)?;
+        trust.bind_endpoint(endpoint, device_id)?;
+    }
+    write_typed_frame(&mut send, &PairingMessage::Acknowledged).await?;
+    send.finish().context("finish pairing acknowledgement")?;
+    Ok(true)
 }
 
 async fn run_client_connection(
@@ -787,6 +1100,37 @@ async fn write_reliable(stream: &mut SendStream, event: &ReliableEvent) -> Resul
         .context("write reliable input event")
 }
 
+async fn write_typed_frame<T: serde::Serialize>(stream: &mut SendStream, value: &T) -> Result<()> {
+    let body = encode(value)?;
+    let length = u32::try_from(body.len()).context("pairing frame is too large")?;
+    stream
+        .write_all(&length.to_be_bytes())
+        .await
+        .context("write pairing frame header")?;
+    stream
+        .write_all(&body)
+        .await
+        .context("write pairing frame body")
+}
+
+async fn read_typed_frame<T: DeserializeOwned>(stream: &mut RecvStream) -> Result<T> {
+    let mut header = [0_u8; 4];
+    stream
+        .read_exact(&mut header)
+        .await
+        .context("read pairing frame header")?;
+    let length = u32::from_be_bytes(header) as usize;
+    if length > MAX_RELIABLE_FRAME {
+        bail!("pairing frame length {length} exceeds limit");
+    }
+    let mut body = vec![0_u8; length];
+    stream
+        .read_exact(&mut body)
+        .await
+        .context("read pairing frame body")?;
+    decode(&body)
+}
+
 async fn read_reliable(stream: &mut RecvStream) -> Result<ReliableEvent> {
     let mut header = [0_u8; 4];
     stream
@@ -809,6 +1153,17 @@ async fn read_reliable(stream: &mut RecvStream) -> Result<ReliableEvent> {
 mod tests {
     use super::*;
 
+    fn test_event_bus() -> (AppEventBus, mpsc::Receiver<AppEvent>) {
+        let (sender, receiver) = mpsc::channel(32);
+        (
+            AppEventBus {
+                sender,
+                snapshot: Arc::new(std::sync::RwLock::new(RuntimeSnapshot::default())),
+            },
+            receiver,
+        )
+    }
+
     #[tokio::test]
     async fn idle_runtime_stops_cleanly() {
         let mut runtime = RuntimeHandle::spawn(Arc::new(NoopDiagnostics)).unwrap();
@@ -829,9 +1184,11 @@ mod tests {
                 target: "127.0.0.1:24801".parse().unwrap(),
                 identity_cert: PathBuf::from("identity-cert.der"),
                 identity_key: PathBuf::from("identity-key.der"),
-                server_cert: PathBuf::from("server-cert.der"),
+                server_cert: Some(PathBuf::from("server-cert.der")),
                 size: Some(ScreenSize::new(100, 100).unwrap()),
                 retry_for: Duration::from_secs(30),
+                device_name: "client".to_owned(),
+                trust_store: PathBuf::from("trust.postcard"),
             }),
         };
         runtime
@@ -857,6 +1214,8 @@ mod tests {
                 size: ScreenSize::new(100, 100).unwrap(),
                 devices: Vec::new(),
                 direction: None,
+                device_name: "host".to_owned(),
+                trust_store: PathBuf::from("trust.postcard"),
             }))
             .await
             .unwrap();
@@ -885,6 +1244,7 @@ mod tests {
                 control: None,
                 config: AppConfig::default(),
                 fault: Some(fault),
+                pairing: None,
             }
         );
         runtime.shutdown().await.unwrap();
@@ -905,6 +1265,8 @@ mod tests {
                 size: ScreenSize::new(100, 100).unwrap(),
                 devices: vec![PathBuf::from("/dev/null")],
                 direction: Some(ScreenDirection::Right),
+                device_name: "host".to_owned(),
+                trust_store: directory.path().join("trust.postcard"),
             }))
             .await
             .unwrap();
@@ -920,6 +1282,116 @@ mod tests {
             .await
             .expect("active runtime shutdown timed out")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_devices_wait_for_confirmation_then_persist_both_sides() {
+        let directory = tempfile::tempdir().unwrap();
+        let server_identity = IdentityPaths::in_directory(directory.path().join("server-identity"));
+        let client_identity = IdentityPaths::in_directory(directory.path().join("client-identity"));
+        crate::identity::ensure_identity(&server_identity).unwrap();
+        crate::identity::ensure_identity(&client_identity).unwrap();
+        let server_certificate = fs::read(&server_identity.certificate).unwrap();
+        let client_certificate = fs::read(&client_identity.certificate).unwrap();
+        let server_trust_path = directory.path().join("server-trust");
+        let client_trust_path = directory.path().join("client-trust");
+        let server_endpoint =
+            transport::pairing_server_endpoint("127.0.0.1:0".parse().unwrap(), &server_identity)
+                .unwrap();
+        let remote = server_endpoint.local_addr().unwrap();
+        let client_endpoint =
+            transport::pairing_client_endpoint("0.0.0.0:0".parse().unwrap(), &client_identity)
+                .unwrap();
+        let server_config = HostConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            cert: server_identity.certificate,
+            key: server_identity.private_key,
+            size: ScreenSize::new(100, 100).unwrap(),
+            devices: Vec::new(),
+            direction: Some(ScreenDirection::Right),
+            device_name: "linux-desktop".to_owned(),
+            trust_store: server_trust_path.clone(),
+        };
+        let client_config = ClientConfig {
+            target: remote.to_string().parse().unwrap(),
+            identity_cert: client_identity.certificate,
+            identity_key: client_identity.private_key,
+            server_cert: None,
+            size: Some(ScreenSize::new(100, 100).unwrap()),
+            retry_for: Duration::ZERO,
+            device_name: "macmini".to_owned(),
+            trust_store: client_trust_path.clone(),
+        };
+        let (server_events, mut server_event_rx) = test_event_bus();
+        let (client_events, mut client_event_rx) = test_event_bus();
+        let (decision_tx, mut decision_rx) = mpsc::channel(1);
+        let (server_stop_tx, mut server_stop) = watch::channel(false);
+        let (client_stop_tx, mut client_stop) = watch::channel(false);
+
+        let server_task = tokio::spawn(async move {
+            let connection = transport::accept_one(&server_endpoint).await.unwrap();
+            let mut trust = TrustStore::load(&server_config.trust_store).unwrap();
+            authorize_host_peer(
+                &connection,
+                &server_config,
+                &mut trust,
+                &mut decision_rx,
+                &mut server_stop,
+                &server_events,
+            )
+            .await
+            .unwrap()
+        });
+        let connection = transport::connect(&client_endpoint, remote).await.unwrap();
+        let client_task = tokio::spawn(async move {
+            let mut trust = TrustStore::load(&client_config.trust_store).unwrap();
+            let authorized = authorize_server_peer(
+                &connection,
+                &client_config,
+                &mut trust,
+                &client_events,
+                &mut client_stop,
+            )
+            .await
+            .unwrap();
+            (authorized, connection)
+        });
+
+        let request = loop {
+            if let AppEvent::PairingRequested(request) = server_event_rx.recv().await.unwrap() {
+                break request;
+            }
+        };
+        let client_notice = loop {
+            if let AppEvent::PairingCodeReady(request) = client_event_rx.recv().await.unwrap() {
+                break request;
+            }
+        };
+        assert_eq!(request.request_id, client_notice.request_id);
+        assert_eq!(request.code, client_notice.code);
+        assert!(!server_task.is_finished());
+        decision_tx
+            .send(PairingDecision {
+                request_id: request.request_id,
+                accepted: true,
+            })
+            .await
+            .unwrap();
+        assert!(server_task.await.unwrap());
+        let (client_authorized, _connection) = client_task.await.unwrap();
+        assert!(client_authorized);
+        drop((server_stop_tx, client_stop_tx));
+
+        let server_trust = TrustStore::load(server_trust_path).unwrap();
+        assert!(matches!(
+            server_trust.verify_certificate(&client_certificate),
+            VerifyPeer::Trusted(_)
+        ));
+        let client_trust = TrustStore::load(client_trust_path).unwrap();
+        assert!(matches!(
+            client_trust.verify_endpoint(&remote.to_string(), &server_certificate),
+            VerifyPeer::Trusted(_)
+        ));
     }
 
     #[test]

@@ -4,7 +4,10 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::trust::DeviceId;
+
 const SAS_DOMAIN: &[u8] = b"rflow pairing sas v1\0";
+pub const PAIRING_PROTOCOL_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PairingRole {
@@ -19,6 +22,58 @@ pub struct PairingMaterial {
     pub nonce: [u8; 32],
 }
 
+impl PairingMaterial {
+    pub fn generate(role: PairingRole, certificate: Vec<u8>) -> Result<Self> {
+        let mut nonce = [0_u8; 32];
+        getrandom::fill(&mut nonce)
+            .map_err(|error| anyhow::anyhow!("generate pairing nonce: {error}"))?;
+        Ok(Self {
+            role,
+            certificate,
+            nonce,
+        })
+    }
+
+    pub fn hello(&self, device_name: String) -> PairingMessage {
+        PairingMessage::Hello {
+            version: PAIRING_PROTOCOL_VERSION,
+            role: self.role,
+            device_name,
+            nonce: self.nonce,
+            certificate_fingerprint: DeviceId::from_certificate(&self.certificate),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PairingMessage {
+    Hello {
+        version: u16,
+        role: PairingRole,
+        device_name: String,
+        nonce: [u8; 32],
+        certificate_fingerprint: DeviceId,
+    },
+    Accepted,
+    Acknowledged,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PairingRequestId(pub u64);
+
+impl fmt::Display for PairingRequestId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "p-{:016x}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PairingProof {
+    pub request_id: PairingRequestId,
+    pub code: PairingCode,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PairingCode(u32);
 
@@ -29,6 +84,10 @@ impl fmt::Display for PairingCode {
 }
 
 pub fn pairing_code(first: &PairingMaterial, second: &PairingMaterial) -> Result<PairingCode> {
+    Ok(pairing_proof(first, second)?.code)
+}
+
+pub fn pairing_proof(first: &PairingMaterial, second: &PairingMaterial) -> Result<PairingProof> {
     let (server, client) = match (first.role, second.role) {
         (PairingRole::Server, PairingRole::Client) => (first, second),
         (PairingRole::Client, PairingRole::Server) => (second, first),
@@ -46,7 +105,15 @@ pub fn pairing_code(first: &PairingMaterial, second: &PairingMaterial) -> Result
             .try_into()
             .expect("SHA-256 prefix is four bytes"),
     );
-    Ok(PairingCode(prefix % 1_000_000))
+    let request_id = PairingRequestId(u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 request prefix is eight bytes"),
+    ));
+    Ok(PairingProof {
+        request_id,
+        code: PairingCode(prefix % 1_000_000),
+    })
 }
 
 fn update_length_prefixed(hasher: &mut Sha256, bytes: &[u8]) -> Result<()> {

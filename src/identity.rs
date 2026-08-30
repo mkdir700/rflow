@@ -13,6 +13,14 @@ pub const CERTIFICATE_FILE: &str = "identity-cert.der";
 pub const PRIVATE_KEY_FILE: &str = "identity-key.der";
 pub const TLS_SERVER_NAME: &str = "rflow.local";
 
+pub fn device_display_name() -> String {
+    env::var("COMPUTERNAME")
+        .or_else(|_| env::var("HOSTNAME"))
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "rflow-device".to_owned())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityPaths {
     pub certificate: PathBuf,

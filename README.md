@@ -12,7 +12,7 @@ of building a queue. Keys, mouse buttons, and wheel events use a reliable ordere
 - Place one client in any of eight directions around the host and switch ownership at the matching
   edge or corner.
 - Map the entry coordinate between screens with different resolutions for cardinal layouts.
-- TLS 1.3 authentication and encryption with an explicitly pinned server certificate.
+- TLS 1.3 mutual device authentication with explicit first-connection confirmation.
 - Coalesce `REL_X` and `REL_Y` within an evdev batch and discard stale network datagrams.
 - Release held keys/buttons when the sender disconnects or requests shutdown.
 - IPv4 and IPv6 support, heartbeat, protocol version check, and structured logs.
@@ -38,9 +38,8 @@ process as trusted; macOS may still distinguish the responsible terminal or laun
 
 ## Quick start
 
-The host now creates a persistent device identity automatically. Until interactive pairing lands
-in the next implementation phase, copy its public certificate to the client over a trusted channel.
-The default host certificate is stored at:
+The host and client create persistent device identities automatically. Their default public
+certificates are stored at:
 
 ```text
 Linux:   ~/.config/rflow/identity-cert.der
@@ -48,8 +47,8 @@ macOS:   ~/Library/Application Support/rflow/identity-cert.der
 Windows: %APPDATA%\rflow\identity-cert.der
 ```
 
-Never copy `identity-key.der` away from its device. `rflow keygen` remains available for advanced
-pre-provisioning. Find stable keyboard and mouse paths:
+Never copy `identity-key.der` away from its device. `rflow keygen` and the identity override options
+remain available for advanced pre-provisioning. Find stable keyboard and mouse paths:
 
 ```bash
 ls -l /dev/input/by-id/
@@ -76,7 +75,6 @@ On the client screen, connect to the host:
 
 ```bash
 RUST_LOG=rflow=info rflow client 192.168.1.50 \
-  --server-cert identity-cert.der \
   --retry-for 120
 ```
 
@@ -84,6 +82,16 @@ The client target accepts an IP address or hostname and defaults to UDP port 248
 keeps retrying initial connections and reconnecting dropped sessions for the given
 number of seconds from client startup. This is useful when one Bluetooth keyboard and mouse must be
 switched back to the Linux host before its input devices become available.
+
+On the first connection, both terminals display the same six-digit pairing code. Compare the codes,
+then enter `y` on the host to trust the client. rflow does not grab the host input devices until this
+confirmation succeeds. Both devices remember the trust relationship for later connections.
+
+For unattended pre-provisioning, the client can additionally pin the expected server certificate:
+
+```bash
+rflow client linux-desktop.local --server-cert host-identity-cert.der
+```
 
 The host grabs the selected physical devices and reinjects them locally while its own screen is
 active. Keep SSH or another independent input device available during MVP testing. When the cursor
@@ -128,7 +136,8 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 ## Security notes
 
-The copied server certificate pins the host identity. QUIC encrypts input in transit. The current
-implementation phase does not yet authenticate the client to the host, so expose UDP port 24801
-only to a trusted LAN or restrict it with a host firewall. Interactive mutual pairing is specified
-in [`docs/specs/002.md`](docs/specs/002.md).
+QUIC encrypts input in transit and both devices prove possession of their long-term private keys.
+An unknown device is not trusted until the host accepts a transcript-bound pairing code. Users must
+compare the code shown on both devices to detect a first-connection intermediary. The full security
+model is specified in [`docs/specs/002.md`](docs/specs/002.md) and
+[`docs/adr/001-device-pairing-protocol.md`](docs/adr/001-device-pairing-protocol.md).

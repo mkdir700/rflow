@@ -14,8 +14,12 @@ use sha2::{Digest, Sha256};
 const TRUST_STORE_VERSION: u16 = 1;
 pub const TRUST_STORE_FILE: &str = "trusted-peers.postcard";
 
+pub fn default_trust_store_path() -> Result<PathBuf> {
+    Ok(crate::identity::application_config_directory()?.join(TRUST_STORE_FILE))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct DeviceId([u8; 32]);
+pub struct DeviceId(pub [u8; 32]);
 
 impl DeviceId {
     pub fn from_certificate(certificate: &[u8]) -> Self {
@@ -84,7 +88,7 @@ pub struct TrustStore {
 
 impl TrustStore {
     pub fn platform_default() -> Result<Self> {
-        Self::load(crate::identity::application_config_directory()?.join(TRUST_STORE_FILE))
+        Self::load(default_trust_store_path()?)
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {

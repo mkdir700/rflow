@@ -1,16 +1,23 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    io::{self, Write},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use rflow::{
     core::{ScreenDirection, ScreenSize},
-    identity::{ensure_identity, resolve_identity_paths},
+    identity::{device_display_name, ensure_identity, resolve_identity_paths},
     runtime::{
         AppCommand, AppEvent, ClientConfig, HostConfig, RuntimeHandle, RuntimeStatus,
         TracingDiagnostics,
     },
     target::ServerTarget,
     transport,
+    trust::default_trust_store_path,
 };
 
 #[derive(Debug, Parser)]
@@ -57,7 +64,7 @@ enum Command {
         identity_cert: Option<PathBuf>,
         #[arg(long = "identity-key", requires = "identity_cert")]
         identity_key: Option<PathBuf>,
-        /// Explicitly pin the server certificate until interactive pairing is available.
+        /// Explicitly pin the expected server certificate instead of relying only on pairing.
         #[arg(long)]
         server_cert: Option<PathBuf>,
         /// Override automatic screen-size detection.
@@ -104,6 +111,33 @@ async fn run_session(command: Command) -> Result<()> {
                     tracing::info!(?control, "input control changed")
                 }
                 Some(AppEvent::ConfigChanged(_)) => {}
+                Some(AppEvent::PairingRequested(request)) => {
+                    println!(
+                        "\nPairing request\n\nRequest: {}\nDevice: {}\nAddress: {}\nFingerprint: {}\nPairing code: {}\n",
+                        request.request_id,
+                        request.device_name,
+                        request.address,
+                        request.fingerprint,
+                        request.code,
+                    );
+                    print!("Accept this device? [y/N] ");
+                    io::stdout().flush()?;
+                    let mut answer = String::new();
+                    let accepted = io::stdin().read_line(&mut answer).is_ok()
+                        && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+                    runtime
+                        .send(if accepted {
+                            AppCommand::AcceptPairing(request.request_id)
+                        } else {
+                            AppCommand::RejectPairing(request.request_id)
+                        })
+                        .await?;
+                }
+                Some(AppEvent::PairingCodeReady(request)) => println!(
+                    "\nUntrusted server\nDevice: {}\nAddress: {}\nFingerprint: {}\nPairing code: {}\n\nWaiting for confirmation on the server...",
+                    request.device_name, request.address, request.fingerprint, request.code,
+                ),
+                Some(AppEvent::PairingCleared(_)) => {}
                 Some(AppEvent::Faulted(error)) => {
                     fault = Some(error);
                     break;
@@ -143,6 +177,8 @@ impl Command {
                     size,
                     devices: device,
                     direction,
+                    device_name: device_display_name(),
+                    trust_store: default_trust_store_path()?,
                 })
             }
             Command::Client {
@@ -153,9 +189,6 @@ impl Command {
                 size,
                 retry_for,
             } => {
-                let server_cert = server_cert.context(
-                    "--server-cert is required until interactive device pairing is implemented",
-                )?;
                 let identity = resolve_identity_paths(identity_cert, identity_key)?;
                 ensure_identity(&identity)?;
                 AppCommand::StartClient(ClientConfig {
@@ -165,6 +198,8 @@ impl Command {
                     server_cert,
                     size,
                     retry_for: Duration::from_secs(retry_for),
+                    device_name: device_display_name(),
+                    trust_store: default_trust_store_path()?,
                 })
             }
             Command::Keygen { .. } => unreachable!("keygen is handled before session startup"),
