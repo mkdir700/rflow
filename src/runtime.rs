@@ -39,6 +39,7 @@ const PAIRING_REQUEST_LIFETIME: Duration = Duration::from_secs(120);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConfig {
     pub bind: SocketAddr,
+    pub transport: transport::TransportMode,
     pub cert: PathBuf,
     pub key: PathBuf,
     pub size: Option<ScreenSize>,
@@ -51,6 +52,7 @@ pub struct HostConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
     pub target: ServerTarget,
+    pub transport: transport::TransportMode,
     pub identity_cert: PathBuf,
     pub identity_key: PathBuf,
     pub server_cert: Option<PathBuf>,
@@ -761,7 +763,8 @@ async fn run_host(
     events
         .send(AppEvent::TopologyChanged(topology.clone()))
         .await;
-    let endpoint = transport::pairing_server_endpoint(config.bind, &identity)?;
+    let endpoint =
+        transport::pairing_server_endpoint_with_mode(config.bind, &identity, config.transport)?;
     let mut trust = TrustStore::load(&config.trust_store)?;
     let mut pairing_rate_limiter = PairingRateLimiter::default();
     tracing::info!(local = %endpoint.local_addr()?, "host listening");
@@ -1566,7 +1569,11 @@ async fn run_client(
         .resolve(&inventory)
         .map_err(anyhow::Error::msg)?;
     events.send(AppEvent::TopologyChanged(topology)).await;
-    let endpoint = transport::pairing_client_endpoint(SocketAddr::new(bind_ip, 0), &identity)?;
+    let endpoint = transport::pairing_client_endpoint_with_mode(
+        SocketAddr::new(bind_ip, 0),
+        &identity,
+        config.transport,
+    )?;
     let mut trust = TrustStore::load(&config.trust_store)?;
     let retry_deadline = tokio::time::Instant::now() + config.retry_for;
     let mut attempt = 0_u32;
@@ -2298,6 +2305,7 @@ mod tests {
         let config = AppConfig {
             host: None,
             client: Some(ClientConfig {
+                transport: transport::TransportMode::Quic,
                 target: "127.0.0.1:24801".parse().unwrap(),
                 identity_cert: PathBuf::from("identity-cert.der"),
                 identity_key: PathBuf::from("identity-key.der"),
@@ -2325,6 +2333,7 @@ mod tests {
         let mut runtime = RuntimeHandle::spawn(Arc::new(NoopDiagnostics)).unwrap();
         runtime
             .send(AppCommand::StartHost(HostConfig {
+                transport: transport::TransportMode::Quic,
                 bind: "127.0.0.1:0".parse().unwrap(),
                 cert: PathBuf::from("missing-cert"),
                 key: PathBuf::from("missing-key"),
@@ -2379,6 +2388,7 @@ mod tests {
         let mut runtime = RuntimeHandle::spawn(Arc::new(NoopDiagnostics)).unwrap();
         runtime
             .send(AppCommand::StartHost(HostConfig {
+                transport: transport::TransportMode::Quic,
                 bind: "127.0.0.1:0".parse().unwrap(),
                 cert,
                 key,
@@ -2427,6 +2437,7 @@ mod tests {
             transport::pairing_client_endpoint("0.0.0.0:0".parse().unwrap(), &client_identity)
                 .unwrap();
         let server_config = HostConfig {
+            transport: transport::TransportMode::Quic,
             bind: "127.0.0.1:0".parse().unwrap(),
             cert: server_identity.certificate,
             key: server_identity.private_key,
@@ -2437,6 +2448,7 @@ mod tests {
             trust_store: server_trust_path.clone(),
         };
         let client_config = ClientConfig {
+            transport: transport::TransportMode::Quic,
             target: "linux-desktop.local".parse().unwrap(),
             identity_cert: client_identity.certificate,
             identity_key: client_identity.private_key,
